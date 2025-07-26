@@ -21,24 +21,18 @@ func InitLogger(cfg config.LoggerConfig) error {
 	}
 	Log.SetLevel(level)
 
-	// Set log format
-	switch cfg.Format {
-	case "json":
-		Log.SetFormatter(&logrus.JSONFormatter{})
-	default:
-		Log.SetFormatter(&logrus.TextFormatter{
-			FullTimestamp: true,
-		})
-	}
+	Log.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp: true,
+	})
 
 	// Set output
-	if cfg.FilePath != "" {
+	if cfg.Path != "" {
 		lumberjackLogger := &lumberjack.Logger{
-			Filename:   cfg.FilePath,
-			MaxSize:    cfg.MaxSize,
-			MaxBackups: cfg.MaxBackups,
-			MaxAge:     cfg.MaxAge,
-			Compress:   cfg.Compress,
+			Filename:   cfg.Path,
+			MaxSize:    10, // megabytes
+			MaxBackups: 3,
+			MaxAge:     28, //days
+			Compress:   true,
 		}
 		// Set output to both file and stdout
 		mw := io.MultiWriter(os.Stdout, lumberjackLogger)
