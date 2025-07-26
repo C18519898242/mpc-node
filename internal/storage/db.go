@@ -24,7 +24,7 @@ func InitDB() {
 	fmt.Println("Database connection successfully established.")
 
 	// Auto-migrate the schema
-	err = DB.AutoMigrate(&models.KeyData{})
+	err = DB.AutoMigrate(&models.KeyData{}, &models.KeyShare{})
 	if err != nil {
 		panic(fmt.Sprintf("failed to auto-migrate database: %v", err))
 	}

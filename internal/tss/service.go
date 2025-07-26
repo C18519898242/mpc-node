@@ -116,11 +116,6 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 	pubKeyHex := hex.EncodeToString(pubKey.X().Bytes()) + hex.EncodeToString(pubKey.Y().Bytes())
 	fmt.Printf("Generated Public Key: %s\n", pubKeyHex)
 
-	saveDataBytes, err := json.Marshal(saveData)
-	if err != nil {
-		return nil, fmt.Errorf("error marshalling save data: %v", err)
-	}
-
 	var pIDs []string
 	for _, pID := range partyIDs {
 		pIDs = append(pIDs, pID.Id)
@@ -129,20 +124,53 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 	keyRecord := models.KeyData{
 		KeyID:     uuid.New(),
 		PublicKey: pubKeyHex,
-		KeyData:   saveDataBytes,
 		PartyIDs:  strings.Join(pIDs, ","),
 		Threshold: threshold,
 	}
 
-	fmt.Println("Attempting to save key data to the database...")
-	result := storage.DB.Create(&keyRecord)
-	if result.Error != nil {
-		return nil, fmt.Errorf("!!!!!!!!!! DATABASE SAVE FAILED! Error: %v !!!!!!!!!!", result.Error)
+	// Use a transaction to ensure atomicity
+	tx := storage.DB.Begin()
+	if tx.Error != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %v", tx.Error)
 	}
-	if result.RowsAffected == 0 {
-		return nil, fmt.Errorf("!!!!!!!!!! DATABASE SAVE FAILED! Rows affected is 0. !!!!!!!!!!")
-	}
-	fmt.Printf("Key data successfully saved to database. Rows affected: %d\n", result.RowsAffected)
 
-	return &keyRecord, nil
+	// Create the main key record
+	if err := tx.Create(&keyRecord).Error; err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("failed to create key record: %v", err)
+	}
+
+	// Create a share record for each party
+	for i, pID := range partyIDs {
+		shareBytes, err := json.Marshal(saveData[i])
+		if err != nil {
+			tx.Rollback()
+			return nil, fmt.Errorf("failed to marshal share data for party %s: %v", pID.Id, err)
+		}
+		keyShare := models.KeyShare{
+			KeyDataID: keyRecord.KeyID, // Link to the parent key using UUID
+			ShareData: shareBytes,
+			PartyID:   pID.Id,
+		}
+		if err := tx.Create(&keyShare).Error; err != nil {
+			tx.Rollback()
+			return nil, fmt.Errorf("failed to create key share for party %s: %v", pID.Id, err)
+		}
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %v", err)
+	}
+
+	fmt.Println("Key and shares successfully saved to database.")
+
+	// Preload the shares for the return value
+	// We need to query by the UUID now to get the full record with shares
+	var finalRecord models.KeyData
+	err := storage.DB.Preload("Shares").First(&finalRecord, "key_id = ?", keyRecord.KeyID).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to preload shares for the new key: %v", err)
+	}
+
+	return &finalRecord, nil
 }

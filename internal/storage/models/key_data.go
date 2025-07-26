@@ -9,9 +9,9 @@ import (
 // but adapted for database storage.
 type KeyData struct {
 	gorm.Model
-	KeyID     uuid.UUID `gorm:"type:uuid;uniqueIndex;not null"`
-	PublicKey string    `gorm:"uniqueIndex"` // Store the public key hex
-	KeyData   []byte    // Store the serialized keygen.LocalPartySaveData
-	PartyIDs  string    // Store a comma-separated list of party IDs involved
+	KeyID     uuid.UUID  `gorm:"type:uuid;uniqueIndex;not null"`
+	PublicKey string     `gorm:"type:varchar(200);uniqueIndex"`         // Store the public key hex
+	Shares    []KeyShare `gorm:"foreignKey:KeyDataID;references:KeyID"` // Has-many relationship using UUID
+	PartyIDs  string     // Store a comma-separated list of party IDs involved
 	Threshold int
 }

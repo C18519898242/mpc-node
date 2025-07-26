@@ -26,7 +26,7 @@ func GenerateKey(c *gin.Context) {
 
 func GetKeys(c *gin.Context) {
 	var keys []models.KeyData
-	result := storage.DB.Find(&keys)
+	result := storage.DB.Preload("Shares").Find(&keys)
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to retrieve keys from database.",
@@ -39,7 +39,7 @@ func GetKeys(c *gin.Context) {
 func GetKeyByKeyID(c *gin.Context) {
 	keyID := c.Param("key_id")
 	var key models.KeyData
-	result := storage.DB.First(&key, "key_id = ?", keyID)
+	result := storage.DB.Preload("Shares").First(&key, "key_id = ?", keyID)
 	if result.Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
 		return
