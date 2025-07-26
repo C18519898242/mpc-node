@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"mpc-node/internal/config"
 	"mpc-node/internal/storage/models"
 
 	"gorm.io/driver/postgres"
@@ -11,11 +12,10 @@ import (
 var DB *gorm.DB
 
 // InitDB initializes the database connection.
-// In a real application, the DSN should come from a config file.
-func InitDB() {
+func InitDB(cfg config.DBConfig) {
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%d sslmode=%s TimeZone=%s",
+		cfg.Host, cfg.User, cfg.Password, cfg.DBName, cfg.Port, cfg.SSLMode, cfg.TimeZone)
 	var err error
-	// TODO: Replace with your actual connection string from a config file
-	dsn := "host=39.102.213.42 user=postgres password=P@ssw0rd12345678 dbname=mpc_node port=5432 sslmode=disable TimeZone=Asia/Shanghai"
 	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
 		panic(fmt.Sprintf("failed to connect to database: %v", err))

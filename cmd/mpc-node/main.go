@@ -1,14 +1,22 @@
 package main
 
 import (
+	"log"
 	"mpc-node/api"
+	"mpc-node/internal/config"
 	"mpc-node/internal/storage"
 )
 
 func main() {
+	// Load configuration
+	cfg, err := config.LoadConfig("config.json")
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
 	// Initialize database
-	storage.InitDB()
+	storage.InitDB(cfg.Database)
 
 	router := api.SetupRouter()
-	router.Run(":8080") // listen and serve on 0.0.0.0:8080
+	router.Run(cfg.ServerPort)
 }
