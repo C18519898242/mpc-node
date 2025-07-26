@@ -16,9 +16,13 @@ func SetupRouter() *gin.Engine {
 		})
 	})
 
-	// New endpoint to trigger key generation
-	router.POST("/keys", handlers.GenerateKey)
-	router.GET("/keys", handlers.GetKeys)
+	// Key management endpoints
+	keyGroup := router.Group("/key")
+	{
+		keyGroup.POST("/generate", handlers.GenerateKey)
+		keyGroup.GET("/get", handlers.GetKeys)
+		keyGroup.GET("/:key_id", handlers.GetKeyByKeyID)
+	}
 
 	return router
 }

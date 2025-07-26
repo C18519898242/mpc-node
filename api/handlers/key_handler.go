@@ -10,10 +10,17 @@ import (
 )
 
 func GenerateKey(c *gin.Context) {
-	// In a real app, you might pass parameters from the request to the service
-	go tss.RunTssSimulation()
-	c.JSON(http.StatusAccepted, gin.H{
-		"message": "Key generation process started in the background.",
+	keyRecord, err := tss.GenerateAndSaveKey()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to generate key: " + err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"key_id":     keyRecord.KeyID,
+		"public_key": keyRecord.PublicKey,
 	})
 }
 
@@ -27,4 +34,15 @@ func GetKeys(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, keys)
+}
+
+func GetKeyByKeyID(c *gin.Context) {
+	keyID := c.Param("key_id")
+	var key models.KeyData
+	result := storage.DB.First(&key, "key_id = ?", keyID)
+	if result.Error != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
+		return
+	}
+	c.JSON(http.StatusOK, key)
 }

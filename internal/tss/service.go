@@ -1,22 +1,17 @@
 package tss
 
 import (
-	"crypto/ecdsa"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/big"
 	"mpc-node/internal/storage"
 	"mpc-node/internal/storage/models"
 	"strings"
 	"sync"
 
-	"github.com/bnb-chain/tss-lib/v2/common"
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
-	"github.com/bnb-chain/tss-lib/v2/ecdsa/signing"
 	"github.com/bnb-chain/tss-lib/v2/tss"
-	"github.com/ipfs/go-log"
+	"github.com/google/uuid"
 )
 
 const (
@@ -24,12 +19,10 @@ const (
 	threshold    = 1
 )
 
-func RunTssSimulation() {
+// GenerateAndSaveKey performs the TSS key generation and saves the result to the database.
+// It returns the newly created key record.
+func GenerateAndSaveKey() (*models.KeyData, error) {
 	// 1. --- Setup ---
-	if err := log.SetLogLevel("tss-lib", "info"); err != nil {
-		panic(err)
-	}
-
 	partyIDs := tss.GenerateTestPartyIDs(partiesCount)
 	outCh := make(chan tss.Message, partiesCount*partiesCount)
 	endCh := make(chan *keygen.LocalPartySaveData, partiesCount)
@@ -64,13 +57,11 @@ func RunTssSimulation() {
 		case msg := <-outCh:
 			bz, _, err := msg.WireBytes()
 			if err != nil {
-				fmt.Printf("Error getting wire bytes: %v\n", err)
-				continue
+				return nil, fmt.Errorf("error getting wire bytes: %v", err)
 			}
 			parsedMsg, err := tss.ParseWireMessage(bz, msg.GetFrom(), msg.IsBroadcast())
 			if err != nil {
-				fmt.Printf("Error parsing message: %v\n", err)
-				continue
+				return nil, fmt.Errorf("error parsing message: %v", err)
 			}
 			dest := msg.GetTo()
 			if dest == nil { // broadcast
@@ -97,7 +88,6 @@ func RunTssSimulation() {
 				}
 			}
 		case save := <-endCh:
-			// find party index by ShareID
 			var found bool
 			for i, pID := range partyIDs {
 				if pID.KeyInt().Cmp(save.ShareID) == 0 {
@@ -107,21 +97,18 @@ func RunTssSimulation() {
 				}
 			}
 			if !found {
-				fmt.Println("Error: could not find party for save data")
-				return
+				return nil, fmt.Errorf("could not find party for save data")
 			}
 			finishedParties++
 		case err := <-errCh:
-			fmt.Printf("Error in keygen: %v\n", err)
-			return
+			return nil, fmt.Errorf("error in keygen: %v", err)
 		}
 	}
 
 	wg.Wait()
 	close(errCh)
 	for err := range errCh {
-		fmt.Printf("Error received after wait: %v\n", err)
-		return
+		return nil, fmt.Errorf("error received after wait: %v", err)
 	}
 
 	fmt.Println("Key generation successful!")
@@ -129,11 +116,9 @@ func RunTssSimulation() {
 	pubKeyHex := hex.EncodeToString(pubKey.X().Bytes()) + hex.EncodeToString(pubKey.Y().Bytes())
 	fmt.Printf("Generated Public Key: %s\n", pubKeyHex)
 
-	// Persist key data to the database
 	saveDataBytes, err := json.Marshal(saveData)
 	if err != nil {
-		fmt.Printf("Error marshalling save data: %v\n", err)
-		return
+		return nil, fmt.Errorf("error marshalling save data: %v", err)
 	}
 
 	var pIDs []string
@@ -142,6 +127,7 @@ func RunTssSimulation() {
 	}
 
 	keyRecord := models.KeyData{
+		KeyID:     uuid.New(),
 		PublicKey: pubKeyHex,
 		KeyData:   saveDataBytes,
 		PartyIDs:  strings.Join(pIDs, ","),
@@ -151,121 +137,12 @@ func RunTssSimulation() {
 	fmt.Println("Attempting to save key data to the database...")
 	result := storage.DB.Create(&keyRecord)
 	if result.Error != nil {
-		fmt.Printf("!!!!!!!!!! DATABASE SAVE FAILED! Error: %v !!!!!!!!!!\n", result.Error)
-		return
+		return nil, fmt.Errorf("!!!!!!!!!! DATABASE SAVE FAILED! Error: %v !!!!!!!!!!", result.Error)
 	}
 	if result.RowsAffected == 0 {
-		fmt.Println("!!!!!!!!!! DATABASE SAVE FAILED! Rows affected is 0. !!!!!!!!!!")
-		return
+		return nil, fmt.Errorf("!!!!!!!!!! DATABASE SAVE FAILED! Rows affected is 0. !!!!!!!!!!")
 	}
 	fmt.Printf("Key data successfully saved to database. Rows affected: %d\n", result.RowsAffected)
 
-	// 4. --- Phase 2: Signing ---
-	fmt.Println("\n--- Phase 2: Signing ---")
-
-	signingPartyIDs := partyIDs[:threshold+1]
-	signingParties := make(map[*tss.PartyID]tss.Party, len(signingPartyIDs))
-
-	signOutCh := make(chan tss.Message, len(signingPartyIDs)*len(signingPartyIDs))
-	signEndCh := make(chan *common.SignatureData, len(signingPartyIDs))
-	signErrCh := make(chan *tss.Error, len(signingPartyIDs)*len(signingPartyIDs))
-
-	var signWg sync.WaitGroup
-	signWg.Add(len(signingPartyIDs))
-
-	msg := "Hello, TSS!"
-	hash := sha256.Sum256([]byte(msg))
-	msgToSign := new(big.Int).SetBytes(hash[:])
-
-	fmt.Printf("Message to sign: \"%s\"\n", msg)
-	fmt.Printf("Message hash: %x\n", msgToSign)
-
-	// 5. --- Create and start signing parties ---
-	for _, pID := range signingPartyIDs {
-		ctx := tss.NewPeerContext(signingPartyIDs)
-		params := tss.NewParameters(tss.S256(), ctx, pID, len(signingPartyIDs), threshold)
-		party := signing.NewLocalParty(msgToSign, params, *saveData[pID.Index], signOutCh, signEndCh)
-		signingParties[pID] = party
-		go func(p tss.Party) {
-			defer signWg.Done()
-			if err := p.Start(); err != nil {
-				signErrCh <- err
-			}
-		}(party)
-	}
-
-	// 6. --- Network Simulation (Signing) ---
-	var signature common.SignatureData
-	signFinishedParties := 0
-	for signFinishedParties < len(signingPartyIDs) {
-		select {
-		case msg := <-signOutCh:
-			bz, _, err := msg.WireBytes()
-			if err != nil {
-				fmt.Printf("Error getting wire bytes: %v\n", err)
-				continue
-			}
-			parsedMsg, err := tss.ParseWireMessage(bz, msg.GetFrom(), msg.IsBroadcast())
-			if err != nil {
-				fmt.Printf("Error parsing message: %v\n", err)
-				continue
-			}
-			dest := msg.GetTo()
-			if dest == nil { // broadcast
-				for _, pID := range signingPartyIDs {
-					if pID == msg.GetFrom() {
-						continue
-					}
-					go func(p tss.Party) {
-						if _, err := p.Update(parsedMsg); err != nil {
-							signErrCh <- err
-						}
-					}(signingParties[pID])
-				}
-			} else { // point-to-point
-				for _, pID := range dest {
-					if pID == msg.GetFrom() {
-						continue
-					}
-					go func(p tss.Party) {
-						if _, err := p.Update(parsedMsg); err != nil {
-							signErrCh <- err
-						}
-					}(signingParties[pID])
-				}
-			}
-		case sig := <-signEndCh:
-			signature = *sig
-			signFinishedParties++
-		case err := <-errCh:
-			fmt.Printf("Error in signing: %v\n", err)
-			return
-		}
-	}
-
-	signWg.Wait()
-	close(signErrCh)
-	for err := range signErrCh {
-		fmt.Printf("Error received after sign wait: %v\n", err)
-		return
-	}
-
-	fmt.Println("Signing successful!")
-	fmt.Printf("Signature R: %s\n", new(big.Int).SetBytes(signature.R))
-	fmt.Printf("Signature S: %s\n", new(big.Int).SetBytes(signature.S))
-
-	// 7. --- Phase 3: Verification ---
-	fmt.Println("\n--- Phase 3: Verification ---")
-	pk := &ecdsa.PublicKey{
-		Curve: tss.S256(),
-		X:     pubKey.X(),
-		Y:     pubKey.Y(),
-	}
-	ok := ecdsa.Verify(pk, msgToSign.Bytes(), new(big.Int).SetBytes(signature.R), new(big.Int).SetBytes(signature.S))
-
-	if ok {
-		fmt.Println("✅ Signature verified successfully!")
-	} else {
-		fmt.Println("❌ Signature verification failed!")
-	}
+	return &keyRecord, nil
 }
