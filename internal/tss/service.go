@@ -3,8 +3,13 @@ package tss
 import (
 	"crypto/ecdsa"
 	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
+	"mpc-node/internal/storage"
+	"mpc-node/internal/storage/models"
+	"strings"
 	"sync"
 
 	"github.com/bnb-chain/tss-lib/v2/common"
@@ -121,7 +126,39 @@ func RunTssSimulation() {
 
 	fmt.Println("Key generation successful!")
 	pubKey := saveData[0].ECDSAPub
-	fmt.Printf("Generated Public Key: X: %s, Y: %s\n", pubKey.X(), pubKey.Y())
+	pubKeyHex := hex.EncodeToString(pubKey.X().Bytes()) + hex.EncodeToString(pubKey.Y().Bytes())
+	fmt.Printf("Generated Public Key: %s\n", pubKeyHex)
+
+	// Persist key data to the database
+	saveDataBytes, err := json.Marshal(saveData)
+	if err != nil {
+		fmt.Printf("Error marshalling save data: %v\n", err)
+		return
+	}
+
+	var pIDs []string
+	for _, pID := range partyIDs {
+		pIDs = append(pIDs, pID.Id)
+	}
+
+	keyRecord := models.KeyData{
+		PublicKey: pubKeyHex,
+		KeyData:   saveDataBytes,
+		PartyIDs:  strings.Join(pIDs, ","),
+		Threshold: threshold,
+	}
+
+	fmt.Println("Attempting to save key data to the database...")
+	result := storage.DB.Create(&keyRecord)
+	if result.Error != nil {
+		fmt.Printf("!!!!!!!!!! DATABASE SAVE FAILED! Error: %v !!!!!!!!!!\n", result.Error)
+		return
+	}
+	if result.RowsAffected == 0 {
+		fmt.Println("!!!!!!!!!! DATABASE SAVE FAILED! Rows affected is 0. !!!!!!!!!!")
+		return
+	}
+	fmt.Printf("Key data successfully saved to database. Rows affected: %d\n", result.RowsAffected)
 
 	// 4. --- Phase 2: Signing ---
 	fmt.Println("\n--- Phase 2: Signing ---")
