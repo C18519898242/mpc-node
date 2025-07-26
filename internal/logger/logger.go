@@ -4,9 +4,9 @@ import (
 	"io"
 	"mpc-node/internal/config"
 	"os"
-	"path/filepath"
 
 	"github.com/sirupsen/logrus"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // Log is the global logger instance.
@@ -33,20 +33,15 @@ func InitLogger(cfg config.LoggerConfig) error {
 
 	// Set output
 	if cfg.FilePath != "" {
-		// Create the log directory if it doesn't exist
-		logDir := filepath.Dir(cfg.FilePath)
-		if err := os.MkdirAll(logDir, os.ModePerm); err != nil {
-			return err
+		lumberjackLogger := &lumberjack.Logger{
+			Filename:   cfg.FilePath,
+			MaxSize:    cfg.MaxSize,
+			MaxBackups: cfg.MaxBackups,
+			MaxAge:     cfg.MaxAge,
+			Compress:   cfg.Compress,
 		}
-
-		// Open the log file
-		file, err := os.OpenFile(cfg.FilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-		if err != nil {
-			return err
-		}
-
 		// Set output to both file and stdout
-		mw := io.MultiWriter(os.Stdout, file)
+		mw := io.MultiWriter(os.Stdout, lumberjackLogger)
 		Log.SetOutput(mw)
 	} else {
 		Log.SetOutput(os.Stdout)

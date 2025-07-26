@@ -18,9 +18,13 @@ type DBConfig struct {
 
 // LoggerConfig holds the logging configuration.
 type LoggerConfig struct {
-	Level    string `json:"level"`     // e.g., "debug", "info", "warn", "error"
-	Format   string `json:"format"`    // e.g., "text", "json"
-	FilePath string `json:"file_path"` // e.g., "logs/mpc-node.log"
+	Level      string `json:"level"`       // e.g., "debug", "info", "warn", "error"
+	Format     string `json:"format"`      // e.g., "text", "json"
+	FilePath   string `json:"file_path"`   // e.g., "logs/mpc-node.log"
+	MaxSize    int    `json:"max_size"`    // max size in megabytes
+	MaxBackups int    `json:"max_backups"` // max number of old log files to retain
+	MaxAge     int    `json:"max_age"`     // max number of days to retain old log files
+	Compress   bool   `json:"compress"`    // whether to compress old log files
 }
 
 // Config holds the application's configuration values.
