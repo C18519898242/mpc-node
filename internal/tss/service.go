@@ -180,7 +180,7 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 	return &finalRecord, nil
 }
 
-func SignAndVerify(keyID uuid.UUID, message string) (*common.SignatureData, error) {
+func SignMessage(keyID uuid.UUID, message string) (*common.SignatureData, error) {
 	// 1. --- Load Key and Shares from DB ---
 	var keyRecord models.KeyData
 	err := storage.DB.Preload("Shares").First(&keyRecord, "key_id = ?", keyID).Error
@@ -293,18 +293,34 @@ func SignAndVerify(keyID uuid.UUID, message string) (*common.SignatureData, erro
 	}
 	signWg.Wait()
 
-	// 5. --- Verification ---
-	pubKey := saveData[0].ECDSAPub
-	pk := &ecdsa.PublicKey{
-		Curve: tss.S256(),
-		X:     pubKey.X(),
-		Y:     pubKey.Y(),
+	// Close the error channel and check for any remaining errors
+	close(signErrCh)
+	for err := range signErrCh {
+		return nil, fmt.Errorf("error received after wait: %v", err)
 	}
-	ok := ecdsa.Verify(pk, msgToSign.Bytes(), new(big.Int).SetBytes(signature.R), new(big.Int).SetBytes(signature.S))
-	if !ok {
-		return nil, fmt.Errorf("signature verification failed")
-	}
-	fmt.Println("✅ Signature verified successfully!")
 
 	return signature, nil
+}
+
+// VerifySignature verifies a signature against a public key and message.
+func VerifySignature(publicKeyHex string, message string, signatureData common.SignatureData) (bool, error) {
+	pubKeyBytes, err := hex.DecodeString(publicKeyHex)
+	if err != nil {
+		return false, fmt.Errorf("invalid public key hex: %v", err)
+	}
+	if len(pubKeyBytes) != 64 {
+		return false, fmt.Errorf("invalid public key length")
+	}
+
+	pk := &ecdsa.PublicKey{
+		Curve: tss.S256(),
+		X:     new(big.Int).SetBytes(pubKeyBytes[:32]),
+		Y:     new(big.Int).SetBytes(pubKeyBytes[32:]),
+	}
+
+	hash := sha256.Sum256([]byte(message))
+	msgToVerify := new(big.Int).SetBytes(hash[:])
+
+	ok := ecdsa.Verify(pk, msgToVerify.Bytes(), new(big.Int).SetBytes(signatureData.R), new(big.Int).SetBytes(signatureData.S))
+	return ok, nil
 }
