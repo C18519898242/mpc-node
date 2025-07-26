@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"mpc-node/internal/config"
+	"mpc-node/internal/logger"
 	"mpc-node/internal/storage/models"
 
 	"gorm.io/driver/postgres"
@@ -18,15 +19,15 @@ func InitDB(cfg config.DBConfig) {
 	var err error
 	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
-		panic(fmt.Sprintf("failed to connect to database: %v", err))
+		logger.Log.Fatalf("Failed to connect to database: %v", err)
 	}
 
-	fmt.Println("Database connection successfully established.")
+	logger.Log.Info("Database connection successfully established.")
 
 	// Auto-migrate the schema
 	err = DB.AutoMigrate(&models.KeyData{}, &models.KeyShare{})
 	if err != nil {
-		panic(fmt.Sprintf("failed to auto-migrate database: %v", err))
+		logger.Log.Fatalf("Failed to auto-migrate database: %v", err)
 	}
-	fmt.Println("Database schema migrated.")
+	logger.Log.Info("Database schema migrated.")
 }

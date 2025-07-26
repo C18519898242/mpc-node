@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"mpc-node/internal/logger"
 	"mpc-node/internal/storage"
 	"mpc-node/internal/storage/models"
 	"strings"
@@ -39,7 +40,7 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 	parties := make(map[*tss.PartyID]tss.Party, partiesCount)
 	saveData := make([]*keygen.LocalPartySaveData, partiesCount)
 
-	fmt.Println("--- Phase 1: Key Generation ---")
+	logger.Log.Info("--- Phase 1: Key Generation ---")
 
 	// 2. --- Key Generation ---
 	for i := 0; i < partiesCount; i++ {
@@ -113,13 +114,14 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 	wg.Wait()
 	close(errCh)
 	for err := range errCh {
+		logger.Log.Errorf("Error received after wait: %v", err)
 		return nil, fmt.Errorf("error received after wait: %v", err)
 	}
 
-	fmt.Println("Key generation successful!")
+	logger.Log.Info("Key generation successful!")
 	pubKey := saveData[0].ECDSAPub
 	pubKeyHex := hex.EncodeToString(pubKey.X().Bytes()) + hex.EncodeToString(pubKey.Y().Bytes())
-	fmt.Printf("Generated Public Key: %s\n", pubKeyHex)
+	logger.Log.Infof("Generated Public Key: %s", pubKeyHex)
 
 	var pIDs []string
 	for _, pID := range partyIDs {
@@ -167,7 +169,7 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 		return nil, fmt.Errorf("failed to commit transaction: %v", err)
 	}
 
-	fmt.Println("Key and shares successfully saved to database.")
+	logger.Log.Info("Key and shares successfully saved to database.")
 
 	// Preload the shares for the return value
 	// We need to query by the UUID now to get the full record with shares

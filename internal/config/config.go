@@ -16,10 +16,17 @@ type DBConfig struct {
 	TimeZone string `json:"timezone"`
 }
 
+// LoggerConfig holds the logging configuration.
+type LoggerConfig struct {
+	Level  string `json:"level"`  // e.g., "debug", "info", "warn", "error"
+	Format string `json:"format"` // e.g., "text", "json"
+}
+
 // Config holds the application's configuration values.
 type Config struct {
-	ServerPort string   `json:"server_port"`
-	Database   DBConfig `json:"database"`
+	ServerPort string       `json:"server_port"`
+	Database   DBConfig     `json:"database"`
+	Logger     LoggerConfig `json:"logger"`
 }
 
 // LoadConfig reads the configuration from a file and returns a Config struct.

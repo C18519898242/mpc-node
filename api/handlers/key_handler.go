@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"mpc-node/internal/logger"
 	"mpc-node/internal/storage"
 	"mpc-node/internal/storage/models"
 	"mpc-node/internal/tss"
@@ -26,6 +27,7 @@ type VerifyRequest struct {
 func GenerateKey(c *gin.Context) {
 	keyRecord, err := tss.GenerateAndSaveKey()
 	if err != nil {
+		logger.Log.Errorf("Failed to generate key: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to generate key: " + err.Error(),
 		})
@@ -43,6 +45,7 @@ func ListKeys(c *gin.Context) {
 	// We only need KeyID and PublicKey, no need to Preload Shares
 	result := storage.DB.Find(&keys)
 	if result.Error != nil {
+		logger.Log.Errorf("Failed to retrieve keys from database: %v", result.Error)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to retrieve keys from database.",
 		})
@@ -71,6 +74,7 @@ func GetKeyByKeyID(c *gin.Context) {
 	var key models.KeyData
 	result := storage.DB.Preload("Shares").First(&key, "key_id = ?", keyID)
 	if result.Error != nil {
+		logger.Log.Warnf("Key not found for ID %s: %v", keyID, result.Error)
 		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
 		return
 	}
@@ -80,18 +84,21 @@ func GetKeyByKeyID(c *gin.Context) {
 func SignMessage(c *gin.Context) {
 	var req SignRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.Log.Errorf("SignMessage: Bad request format: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	keyUUID, err := uuid.Parse(req.KeyID)
 	if err != nil {
+		logger.Log.Errorf("Invalid KeyID format: %s", req.KeyID)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid KeyID format"})
 		return
 	}
 
 	signature, err := tss.SignMessage(keyUUID, req.Message)
 	if err != nil {
+		logger.Log.Errorf("Failed to sign message for key %s: %v", req.KeyID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to sign message: " + err.Error()})
 		return
 	}
@@ -104,6 +111,7 @@ func SignMessage(c *gin.Context) {
 func VerifySignature(c *gin.Context) {
 	var req VerifyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.Log.Errorf("VerifySignature: Bad request format: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -112,16 +120,19 @@ func VerifySignature(c *gin.Context) {
 	// If PublicKey is not provided, try to get it from the database using KeyID
 	if publicKey == "" {
 		if req.KeyID == "" {
+			logger.Log.Error("Verification request missing key_id and public_key")
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Either key_id or public_key must be provided"})
 			return
 		}
 		keyUUID, err := uuid.Parse(req.KeyID)
 		if err != nil {
+			logger.Log.Errorf("Invalid KeyID format for verification: %s", req.KeyID)
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid KeyID format"})
 			return
 		}
 		var keyRecord models.KeyData
 		if err := storage.DB.First(&keyRecord, "key_id = ?", keyUUID).Error; err != nil {
+			logger.Log.Warnf("Key not found for verification, ID %s: %v", req.KeyID, err)
 			c.JSON(http.StatusNotFound, gin.H{"error": "Key not found"})
 			return
 		}
@@ -130,6 +141,7 @@ func VerifySignature(c *gin.Context) {
 
 	ok, err := tss.VerifySignature(publicKey, req.Message, req.Signature)
 	if err != nil {
+		logger.Log.Errorf("Failed to verify signature: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify signature: " + err.Error()})
 		return
 	}
