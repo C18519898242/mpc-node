@@ -17,3 +17,6 @@
 
 # Local configuration
 config.json
+
+# Log files
+logs/
