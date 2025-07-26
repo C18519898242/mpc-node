@@ -12,16 +12,25 @@ import (
 	"github.com/google/uuid"
 )
 
+// SignatureData mirrors tss-lib's SignatureData but with camelCase JSON tags.
+type SignatureData struct {
+	Signature         []byte `json:"signature,omitempty"`
+	SignatureRecovery []byte `json:"signatureRecovery,omitempty"`
+	R                 []byte `json:"r,omitempty"`
+	S                 []byte `json:"s,omitempty"`
+	M                 []byte `json:"m,omitempty"`
+}
+
 type SignRequest struct {
-	KeyID   string `json:"key_id" binding:"required"`
+	KeyID   string `json:"keyId" binding:"required"`
 	Message string `json:"message" binding:"required"`
 }
 
 type VerifyRequest struct {
-	KeyID     string `json:"key_id"`
-	PublicKey string `json:"public_key"`
-	Message   string `json:"message" binding:"required"`
-	Signature common.SignatureData
+	KeyID     string        `json:"keyId"`
+	PublicKey string        `json:"publicKey"`
+	Message   string        `json:"message" binding:"required"`
+	Signature SignatureData `json:"signature"`
 }
 
 func GenerateKey(c *gin.Context) {
@@ -35,8 +44,8 @@ func GenerateKey(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"key_id":     keyRecord.KeyID,
-		"public_key": keyRecord.PublicKey,
+		"keyId":     keyRecord.KeyID,
+		"publicKey": keyRecord.PublicKey,
 	})
 }
 
@@ -54,8 +63,8 @@ func ListKeys(c *gin.Context) {
 
 	// Create a custom response struct
 	type KeyInfo struct {
-		KeyID     string `json:"key_id"`
-		PublicKey string `json:"public_key"`
+		KeyID     string `json:"keyId"`
+		PublicKey string `json:"publicKey"`
 	}
 
 	var response []KeyInfo
@@ -103,8 +112,17 @@ func SignMessage(c *gin.Context) {
 		return
 	}
 
+	// Map to our custom SignatureData struct for camelCase response
+	response := SignatureData{
+		Signature:         signature.Signature,
+		SignatureRecovery: signature.SignatureRecovery,
+		R:                 signature.R,
+		S:                 signature.S,
+		M:                 signature.M,
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"signature": signature,
+		"signature": response,
 	})
 }
 
@@ -120,8 +138,8 @@ func VerifySignature(c *gin.Context) {
 	// If PublicKey is not provided, try to get it from the database using KeyID
 	if publicKey == "" {
 		if req.KeyID == "" {
-			logger.Log.Error("Verification request missing key_id and public_key")
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Either key_id or public_key must be provided"})
+			logger.Log.Error("Verification request missing keyId and publicKey")
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Either keyId or publicKey must be provided"})
 			return
 		}
 		keyUUID, err := uuid.Parse(req.KeyID)
@@ -139,7 +157,16 @@ func VerifySignature(c *gin.Context) {
 		publicKey = keyRecord.PublicKey
 	}
 
-	ok, err := tss.VerifySignature(publicKey, req.Message, req.Signature)
+	// Map our custom SignatureData to the tss-lib struct
+	tssSignature := common.SignatureData{
+		Signature:         req.Signature.Signature,
+		SignatureRecovery: req.Signature.SignatureRecovery,
+		R:                 req.Signature.R,
+		S:                 req.Signature.S,
+		M:                 req.Signature.M,
+	}
+
+	ok, err := tss.VerifySignature(publicKey, req.Message, tssSignature)
 	if err != nil {
 		logger.Log.Errorf("Failed to verify signature: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify signature: " + err.Error()})

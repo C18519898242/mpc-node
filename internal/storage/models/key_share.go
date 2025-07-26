@@ -9,7 +9,7 @@ import (
 // It belongs to a KeyData record.
 type KeyShare struct {
 	gorm.Model
-	KeyDataID uuid.UUID `gorm:"type:uuid;index"` // Foreign key to the KeyData table's KeyID
-	ShareData []byte    // The serialized keygen.LocalPartySaveData for one party
-	PartyID   string    // The party ID this share belongs to
+	KeyDataID uuid.UUID `gorm:"type:uuid;index" json:"-"` // Foreign key to the KeyData table's KeyID
+	ShareData []byte    `json:"shareData"`                // The serialized keygen.LocalPartySaveData for one party
+	PartyID   string    `json:"partyId"`                  // The party ID this share belongs to
 }
