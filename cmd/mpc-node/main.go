@@ -9,8 +9,7 @@ import (
 	"net"
 )
 
-func startTCPServer() {
-	listenAddr := ":8001"
+func startTCPServer(listenAddr string) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		logger.Log.Fatalf("Failed to listen on %s: %v", listenAddr, err)
@@ -63,7 +62,9 @@ func main() {
 	storage.InitDB(cfg.Database)
 	logger.Log.Info("Database initialized.")
 
-	go startTCPServer()
+	go startTCPServer(":8001")
+	go startTCPServer(":8002")
+	go startTCPServer(":8003")
 
 	router := api.SetupRouter()
 	logger.Log.Infof("Starting server on port %s", cfg.ServerPort)
