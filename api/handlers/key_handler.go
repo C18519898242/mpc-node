@@ -24,16 +24,32 @@ func GenerateKey(c *gin.Context) {
 	})
 }
 
-func GetKeys(c *gin.Context) {
+func ListKeys(c *gin.Context) {
 	var keys []models.KeyData
-	result := storage.DB.Preload("Shares").Find(&keys)
+	// We only need KeyID and PublicKey, no need to Preload Shares
+	result := storage.DB.Find(&keys)
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to retrieve keys from database.",
 		})
 		return
 	}
-	c.JSON(http.StatusOK, keys)
+
+	// Create a custom response struct
+	type KeyInfo struct {
+		KeyID     string `json:"key_id"`
+		PublicKey string `json:"public_key"`
+	}
+
+	var response []KeyInfo
+	for _, key := range keys {
+		response = append(response, KeyInfo{
+			KeyID:     key.KeyID.String(),
+			PublicKey: key.PublicKey,
+		})
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 func GetKeyByKeyID(c *gin.Context) {
