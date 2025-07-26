@@ -305,7 +305,7 @@ func SignMessage(keyID uuid.UUID, message string) (*common.SignatureData, error)
 }
 
 // VerifySignature verifies a signature against a public key and message.
-func VerifySignature(publicKeyHex string, message string, signatureData common.SignatureData) (bool, error) {
+func VerifySignature(publicKeyHex string, message string, rBytes, sBytes []byte) (bool, error) {
 	pubKeyBytes, err := hex.DecodeString(publicKeyHex)
 	if err != nil {
 		return false, fmt.Errorf("invalid public key hex: %v", err)
@@ -323,6 +323,6 @@ func VerifySignature(publicKeyHex string, message string, signatureData common.S
 	hash := sha256.Sum256([]byte(message))
 	msgToVerify := new(big.Int).SetBytes(hash[:])
 
-	ok := ecdsa.Verify(pk, msgToVerify.Bytes(), new(big.Int).SetBytes(signatureData.R), new(big.Int).SetBytes(signatureData.S))
+	ok := ecdsa.Verify(pk, msgToVerify.Bytes(), new(big.Int).SetBytes(rBytes), new(big.Int).SetBytes(sBytes))
 	return ok, nil
 }

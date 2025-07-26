@@ -1,13 +1,13 @@
 package handlers
 
 import (
+	"encoding/base64"
 	"mpc-node/internal/logger"
 	"mpc-node/internal/storage"
 	"mpc-node/internal/storage/models"
 	"mpc-node/internal/tss"
 	"net/http"
 
-	"github.com/bnb-chain/tss-lib/v2/common"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -27,10 +27,10 @@ type SignRequest struct {
 }
 
 type VerifyRequest struct {
-	KeyID     string        `json:"keyId"`
-	PublicKey string        `json:"publicKey"`
-	Message   string        `json:"message" binding:"required"`
-	Signature SignatureData `json:"signature"`
+	KeyID     string `json:"keyId"`
+	PublicKey string `json:"publicKey"`
+	Message   string `json:"message" binding:"required"`
+	Signature string `json:"signature" binding:"required"`
 }
 
 func GenerateKey(c *gin.Context) {
@@ -157,16 +157,22 @@ func VerifySignature(c *gin.Context) {
 		publicKey = keyRecord.PublicKey
 	}
 
-	// Map our custom SignatureData to the tss-lib struct
-	tssSignature := common.SignatureData{
-		Signature:         req.Signature.Signature,
-		SignatureRecovery: req.Signature.SignatureRecovery,
-		R:                 req.Signature.R,
-		S:                 req.Signature.S,
-		M:                 req.Signature.M,
+	// Decode the signature from base64 and split it into R and S
+	sigBytes, err := base64.StdEncoding.DecodeString(req.Signature)
+	if err != nil {
+		logger.Log.Errorf("Failed to decode base64 signature: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid signature format"})
+		return
 	}
+	if len(sigBytes) != 64 {
+		logger.Log.Errorf("Invalid signature length: got %d, want 64", len(sigBytes))
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid signature length"})
+		return
+	}
+	rBytes := sigBytes[:32]
+	sBytes := sigBytes[32:]
 
-	ok, err := tss.VerifySignature(publicKey, req.Message, tssSignature)
+	ok, err := tss.VerifySignature(publicKey, req.Message, rBytes, sBytes)
 	if err != nil {
 		logger.Log.Errorf("Failed to verify signature: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify signature: " + err.Error()})
