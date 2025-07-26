@@ -7,7 +7,13 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
+
+type SignRequest struct {
+	KeyID   string `json:"key_id" binding:"required"`
+	Message string `json:"message" binding:"required"`
+}
 
 func GenerateKey(c *gin.Context) {
 	keyRecord, err := tss.GenerateAndSaveKey()
@@ -61,4 +67,29 @@ func GetKeyByKeyID(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, key)
+}
+
+func SignMessage(c *gin.Context) {
+	var req SignRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	keyUUID, err := uuid.Parse(req.KeyID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid KeyID format"})
+		return
+	}
+
+	signature, err := tss.SignAndVerify(keyUUID, req.Message)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to sign message: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":   "Message signed and verified successfully",
+		"signature": signature,
+	})
 }

@@ -1,15 +1,20 @@
 package tss
 
 import (
+	"crypto/ecdsa"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"mpc-node/internal/storage"
 	"mpc-node/internal/storage/models"
 	"strings"
 	"sync"
 
+	"github.com/bnb-chain/tss-lib/v2/common"
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
+	"github.com/bnb-chain/tss-lib/v2/ecdsa/signing"
 	"github.com/bnb-chain/tss-lib/v2/tss"
 	"github.com/google/uuid"
 )
@@ -173,4 +178,133 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 	}
 
 	return &finalRecord, nil
+}
+
+func SignAndVerify(keyID uuid.UUID, message string) (*common.SignatureData, error) {
+	// 1. --- Load Key and Shares from DB ---
+	var keyRecord models.KeyData
+	err := storage.DB.Preload("Shares").First(&keyRecord, "key_id = ?", keyID).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to find key with ID %s: %v", keyID, err)
+	}
+	if len(keyRecord.Shares) == 0 {
+		return nil, fmt.Errorf("no shares found for key with ID %s", keyID)
+	}
+
+	// 2. --- Deserialize Shares ---
+	saveData := make([]*keygen.LocalPartySaveData, len(keyRecord.Shares))
+	for i, share := range keyRecord.Shares {
+		var shareData keygen.LocalPartySaveData
+		if err := json.Unmarshal(share.ShareData, &shareData); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal share data for party %s: %v", share.PartyID, err)
+		}
+		saveData[i] = &shareData
+	}
+
+	// 3. --- Setup Signing Parties ---
+	// Reconstruct PartyIDs from the saved data instead of generating new ones
+	partyIDs := make(tss.UnSortedPartyIDs, len(saveData))
+	saveDataMap := make(map[string]*keygen.LocalPartySaveData, len(saveData))
+	for i, sd := range saveData {
+		// The PartyID is not saved in keygen.LocalPartySaveData, but the ShareID (pID.Key) is.
+		// We stored the party ID string in our KeyShare model.
+		pID := tss.NewPartyID(keyRecord.Shares[i].PartyID, keyRecord.Shares[i].PartyID, sd.ShareID)
+		partyIDs[i] = pID
+		saveDataMap[pID.Id] = sd
+	}
+
+	signingPartyIDs := partyIDs[:keyRecord.Threshold+1]
+
+	signOutCh := make(chan tss.Message, len(signingPartyIDs)*len(signingPartyIDs))
+	signEndCh := make(chan *common.SignatureData, len(signingPartyIDs))
+	signErrCh := make(chan *tss.Error, len(signingPartyIDs)*len(signingPartyIDs))
+
+	var signWg sync.WaitGroup
+	signWg.Add(len(signingPartyIDs))
+
+	hash := sha256.Sum256([]byte(message))
+	msgToSign := new(big.Int).SetBytes(hash[:])
+
+	signingParties := make(map[*tss.PartyID]tss.Party, len(signingPartyIDs))
+	sortedSigningPartyIDs := tss.SortPartyIDs(signingPartyIDs)
+	for _, pID := range signingPartyIDs {
+		params := tss.NewParameters(tss.S256(), tss.NewPeerContext(sortedSigningPartyIDs), pID, len(signingPartyIDs), keyRecord.Threshold)
+		// Look up the correct save data from our map
+		localSaveData, ok := saveDataMap[pID.Id]
+		if !ok {
+			return nil, fmt.Errorf("could not find save data for party %s", pID.Id)
+		}
+		party := signing.NewLocalParty(msgToSign, params, *localSaveData, signOutCh, signEndCh)
+		signingParties[pID] = party
+		go func(p tss.Party) {
+			defer signWg.Done()
+			if err := p.Start(); err != nil {
+				signErrCh <- err
+			}
+		}(party)
+	}
+
+	// 4. --- Network Simulation (Signing) ---
+	var signature *common.SignatureData
+	finishedSigners := 0
+	for finishedSigners < len(signingPartyIDs) {
+		select {
+		case msg := <-signOutCh:
+			bz, _, err := msg.WireBytes()
+			if err != nil {
+				signErrCh <- tss.NewError(err, "SignAndVerify", 0, msg.GetFrom())
+				continue
+			}
+			pMsg, err := tss.ParseWireMessage(bz, msg.GetFrom(), msg.IsBroadcast())
+			if err != nil {
+				signErrCh <- tss.NewError(err, "SignAndVerify", 0, msg.GetFrom())
+				continue
+			}
+			dest := msg.GetTo()
+			if dest == nil {
+				for _, pID := range signingPartyIDs {
+					if pID == msg.GetFrom() {
+						continue
+					}
+					go func(p tss.Party) {
+						if _, err := p.Update(pMsg); err != nil {
+							signErrCh <- err
+						}
+					}(signingParties[pID])
+				}
+			} else {
+				for _, pID := range dest {
+					if pID == msg.GetFrom() {
+						continue
+					}
+					go func(p tss.Party) {
+						if _, err := p.Update(pMsg); err != nil {
+							signErrCh <- err
+						}
+					}(signingParties[pID])
+				}
+			}
+		case sig := <-signEndCh:
+			signature = sig
+			finishedSigners++
+		case err := <-signErrCh:
+			return nil, fmt.Errorf("error during signing: %v", err)
+		}
+	}
+	signWg.Wait()
+
+	// 5. --- Verification ---
+	pubKey := saveData[0].ECDSAPub
+	pk := &ecdsa.PublicKey{
+		Curve: tss.S256(),
+		X:     pubKey.X(),
+		Y:     pubKey.Y(),
+	}
+	ok := ecdsa.Verify(pk, msgToSign.Bytes(), new(big.Int).SetBytes(signature.R), new(big.Int).SetBytes(signature.S))
+	if !ok {
+		return nil, fmt.Errorf("signature verification failed")
+	}
+	fmt.Println("✅ Signature verified successfully!")
+
+	return signature, nil
 }

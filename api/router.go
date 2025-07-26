@@ -20,6 +20,7 @@ func SetupRouter() *gin.Engine {
 	keyGroup := router.Group("/key")
 	{
 		keyGroup.POST("/generate", handlers.GenerateKey)
+		keyGroup.POST("/sign", handlers.SignMessage)
 		keyGroup.GET("/list", handlers.ListKeys)
 		keyGroup.GET("/:key_id", handlers.GetKeyByKeyID)
 	}
