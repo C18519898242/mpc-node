@@ -5,12 +5,14 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math/big"
+	"net/http"
 	"sync"
 
 	"github.com/bnb-chain/tss-lib/v2/common"
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/signing"
 	"github.com/bnb-chain/tss-lib/v2/tss"
+	"github.com/gin-gonic/gin"
 	"github.com/ipfs/go-log"
 )
 
@@ -19,7 +21,7 @@ const (
 	threshold    = 1
 )
 
-func main() {
+func runTssSimulation() {
 	// 1. --- Setup ---
 	if err := log.SetLogLevel("tss-lib", "info"); err != nil {
 		panic(err)
@@ -231,4 +233,18 @@ func main() {
 	} else {
 		fmt.Println("❌ Signature verification failed!")
 	}
+}
+
+func main() {
+	// For demonstration, we'll run the simulation in a goroutine.
+	// In a real application, you would trigger this from an API endpoint.
+	go runTssSimulation()
+
+	router := gin.Default()
+	router.GET("/ping", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "pong",
+		})
+	})
+	router.Run(":8080") // listen and serve on 0.0.0.0:8080
 }
