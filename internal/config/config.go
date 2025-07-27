@@ -23,10 +23,19 @@ type LoggerConfig struct {
 	Path  string `json:"path"`  // e.g., "logs/mpc-node.log"
 }
 
+// PartyInfo holds the configuration for a single TSS party.
+type PartyInfo struct {
+	Name    string `json:"name"`
+	Host    string `json:"host"`
+	Port    string `json:"port"`
+	PartyID string `json:"party_id"`
+}
+
 // Config holds the application's configuration values.
 type Config struct {
 	ServerPort string       `json:"server_port"`
-	NodePorts  []string     `json:"node_ports"`
+	Self       PartyInfo    `json:"self"`
+	Parties    []PartyInfo  `json:"parties"`
 	Database   DBConfig     `json:"database"`
 	Logger     LoggerConfig `json:"logger"`
 }

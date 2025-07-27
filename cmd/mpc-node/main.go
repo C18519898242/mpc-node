@@ -87,10 +87,8 @@ func main() {
 	storage.InitDB(cfg.Database)
 	logger.Log.Info("Database initialized.")
 
-	// Start TCP servers for TSS nodes based on config
-	for _, port := range cfg.NodePorts {
-		go startTCPServer(port)
-	}
+	// Start TCP server for this node
+	go startTCPServer(cfg.Self.Port)
 
 	router := api.SetupRouter(cfg)
 	logger.Log.Infof("Starting server on port %s", cfg.ServerPort)

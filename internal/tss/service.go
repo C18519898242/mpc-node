@@ -14,6 +14,7 @@ import (
 	"mpc-node/internal/party"
 	"mpc-node/internal/storage"
 	"mpc-node/internal/storage/models"
+	"net"
 	"strings"
 	"sync"
 
@@ -37,29 +38,31 @@ func GenerateAndSaveKey(cfg *config.Config) (*models.KeyData, error) {
 	defer cancel() // Ensure all goroutines are signalled to stop when we exit
 
 	// 1. --- Party and Network Setup ---
-	partyIDs := tss.GenerateTestPartyIDs(len(cfg.NodePorts))
-	partyIDMap := make(map[string]string, len(cfg.NodePorts))
-	nodePorts := cfg.NodePorts
-	for i, pID := range partyIDs {
-		partyIDMap[pID.Id] = nodePorts[i]
+	partyIDs := make(tss.UnSortedPartyIDs, len(cfg.Parties))
+	partyIDMap := make(map[string]string, len(cfg.Parties))
+	for i, p := range cfg.Parties {
+		pID := tss.NewPartyID(p.PartyID, p.Name, new(big.Int).SetInt64(int64(i+1)))
+		partyIDs[i] = pID
+		partyIDMap[pID.Id] = net.JoinHostPort(p.Host, p.Port)
 	}
 
-	errCh := make(chan *tss.Error, len(cfg.NodePorts))
-	endCh := make(chan *keygen.LocalPartySaveData, len(cfg.NodePorts))
+	errCh := make(chan *tss.Error, len(cfg.Parties))
+	endCh := make(chan *keygen.LocalPartySaveData, len(cfg.Parties))
 
 	transport := network.NewTCPTransport(partyIDMap)
-	parties := make([]tss.Party, 0, len(cfg.NodePorts))
+	parties := make([]tss.Party, 0, len(cfg.Parties))
 
 	// 2. --- Create and Register Parties ---
-	for i := 0; i < len(cfg.NodePorts); i++ {
-		params := tss.NewParameters(tss.S256(), tss.NewPeerContext(partyIDs), partyIDs[i], len(cfg.NodePorts), threshold)
-		outCh := make(chan tss.Message, len(cfg.NodePorts))
-		inCh := make(chan tss.ParsedMessage, len(cfg.NodePorts))
+	sortedPartyIDs := tss.SortPartyIDs(partyIDs)
+	for i, pInfo := range cfg.Parties {
+		params := tss.NewParameters(tss.S256(), tss.NewPeerContext(sortedPartyIDs), partyIDs[i], len(cfg.Parties), threshold)
+		outCh := make(chan tss.Message, len(cfg.Parties))
+		inCh := make(chan tss.ParsedMessage, len(cfg.Parties))
 
 		p := keygen.NewLocalParty(params, outCh, endCh)
 		parties = append(parties, p)
 
-		party.DefaultRegistry.Register(nodePorts[i], inCh)
+		party.DefaultRegistry.Register(pInfo.Port, inCh)
 
 		// Start a goroutine to handle message transport for this party
 		go func(p tss.Party, pTransport network.Transport, pOutCh <-chan tss.Message, pInCh <-chan tss.ParsedMessage, pCtx context.Context) {
@@ -98,9 +101,9 @@ func GenerateAndSaveKey(cfg *config.Config) (*models.KeyData, error) {
 	}
 
 	// 4. --- Wait for all parties to finish ---
-	saveData := make([]*keygen.LocalPartySaveData, 0, len(cfg.NodePorts))
+	saveData := make([]*keygen.LocalPartySaveData, 0, len(cfg.Parties))
 	finishedParties := 0
-	for finishedParties < len(cfg.NodePorts) {
+	for finishedParties < len(cfg.Parties) {
 		select {
 		case save := <-endCh:
 			saveData = append(saveData, save)
@@ -108,8 +111,8 @@ func GenerateAndSaveKey(cfg *config.Config) (*models.KeyData, error) {
 		case err := <-errCh:
 			logger.Log.Errorf("Error during keygen: %v", err)
 			// Deregister all parties on error
-			for i := 0; i < len(cfg.NodePorts); i++ {
-				party.DefaultRegistry.Deregister(nodePorts[i])
+			for _, pInfo := range cfg.Parties {
+				party.DefaultRegistry.Deregister(pInfo.Port)
 			}
 			return nil, err
 		}
@@ -118,8 +121,8 @@ func GenerateAndSaveKey(cfg *config.Config) (*models.KeyData, error) {
 	startWg.Wait()
 
 	// Deregister all parties now that they are finished
-	for i := 0; i < len(cfg.NodePorts); i++ {
-		party.DefaultRegistry.Deregister(nodePorts[i])
+	for _, pInfo := range cfg.Parties {
+		party.DefaultRegistry.Deregister(pInfo.Port)
 	}
 
 	logger.Log.Info("Key generation successful!")
@@ -221,14 +224,14 @@ func SignMessage(cfg *config.Config, keyID uuid.UUID, message string) (*common.S
 
 	// 3. --- Setup Signing Parties ---
 	partyIDs := make(tss.UnSortedPartyIDs, len(saveData))
-	partyIDMap := make(map[string]string, len(cfg.NodePorts))
+	partyIDMap := make(map[string]string, len(cfg.Parties))
 	for i, sd := range saveData {
 		pID := tss.NewPartyID(keyRecord.Shares[i].PartyID, keyRecord.Shares[i].PartyID, sd.ShareID)
 		partyIDs[i] = pID
-		// Find the corresponding port for the party ID
-		for j, nodePID := range tss.GenerateTestPartyIDs(len(cfg.NodePorts)) {
-			if nodePID.Id == pID.Id {
-				partyIDMap[pID.Id] = cfg.NodePorts[j]
+		// Find the corresponding host and port for the party ID
+		for _, pInfo := range cfg.Parties {
+			if pInfo.PartyID == pID.Id {
+				partyIDMap[pID.Id] = net.JoinHostPort(pInfo.Host, pInfo.Port)
 				break
 			}
 		}
