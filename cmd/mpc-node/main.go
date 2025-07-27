@@ -62,7 +62,7 @@ func handleTCPConnection(conn net.Conn) {
 
 	partyCh, ok := party.DefaultRegistry.Get(port)
 	if !ok {
-		logger.Log.Errorf("No party found for address %s. Cannot route message.", port)
+		logger.Log.Warnf("No active party ceremony for address %s. Dropping message.", port)
 		return
 	}
 
