@@ -23,10 +23,24 @@ type LoggerConfig struct {
 	Path  string `json:"path"`  // e.g., "logs/mpc-node.log"
 }
 
+// Party holds the information for a remote party.
+type Party struct {
+	Name   string `json:"name"`
+	Port   string `json:"port"`
+	Server string `json:"server"`
+}
+
+// Node holds the configuration for a single MPC node.
+type Node struct {
+	Node    string  `json:"node"`
+	Parties []Party `json:"parties"`
+	Port    int     `json:"port"`
+}
+
 // Config holds the application's configuration values.
 type Config struct {
 	ServerPort string       `json:"server_port"`
-	NodePorts  []string     `json:"node_ports"`
+	Nodes      []Node       `json:"nodes"`
 	Database   DBConfig     `json:"database"`
 	Logger     LoggerConfig `json:"logger"`
 }

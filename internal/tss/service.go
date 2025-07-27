@@ -14,6 +14,7 @@ import (
 	"mpc-node/internal/party"
 	"mpc-node/internal/storage"
 	"mpc-node/internal/storage/models"
+	"net"
 	"strings"
 	"sync"
 
@@ -31,35 +32,85 @@ const (
 
 // GenerateAndSaveKey performs the TSS key generation using real network communication
 // and saves the result to the database.
-func GenerateAndSaveKey(cfg *config.Config) (*models.KeyData, error) {
+func GenerateAndSaveKey(cfg *config.Config, nodeName string) (*models.KeyData, error) {
 	logger.Log.Info("--- Phase 1: Setup for Real Network Key Generation ---")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // Ensure all goroutines are signalled to stop when we exit
 
-	// 1. --- Party and Network Setup ---
-	partyIDs := tss.GenerateTestPartyIDs(len(cfg.NodePorts))
-	partyIDMap := make(map[string]string, len(cfg.NodePorts))
-	nodePorts := cfg.NodePorts
-	for i, pID := range partyIDs {
-		partyIDMap[pID.Id] = nodePorts[i]
+	// Find the configuration for the current node
+	var currentNode *config.Node
+	for _, node := range cfg.Nodes {
+		if node.Node == nodeName {
+			currentNode = &node
+			break
+		}
+	}
+	if currentNode == nil {
+		return nil, fmt.Errorf("configuration for node '%s' not found", nodeName)
 	}
 
-	errCh := make(chan *tss.Error, len(cfg.NodePorts))
-	endCh := make(chan *keygen.LocalPartySaveData, len(cfg.NodePorts))
+	// 1. --- Party and Network Setup ---
+	allPartyConfs := append(currentNode.Parties, config.Party{
+		Name:   currentNode.Node,
+		Port:   fmt.Sprintf("%d", currentNode.Port),
+		Server: "127.0.0.1", // Assuming self is always local for now
+	})
+
+	partyIDs := make(tss.UnSortedPartyIDs, len(allPartyConfs))
+	partyIDMap := make(map[string]string, len(allPartyConfs))
+	for i, p := range allPartyConfs {
+		pID := tss.NewPartyID(p.Name, p.Name, new(big.Int).SetInt64(int64(i+1)))
+		partyIDs[i] = pID
+		partyIDMap[pID.Id] = net.JoinHostPort(p.Server, p.Port)
+	}
+	sortedPartyIDs := tss.SortPartyIDs(partyIDs)
+
+	// Find the PartyID for the current node
+	var currentPartyID *tss.PartyID
+	for _, pID := range sortedPartyIDs {
+		if pID.Id == currentNode.Node {
+			currentPartyID = pID
+			break
+		}
+	}
+	if currentPartyID == nil {
+		return nil, fmt.Errorf("could not find party ID for current node '%s'", nodeName)
+	}
+
+	errCh := make(chan *tss.Error, len(sortedPartyIDs))
+	endCh := make(chan *keygen.LocalPartySaveData, len(sortedPartyIDs))
 
 	transport := network.NewTCPTransport(partyIDMap)
-	parties := make([]tss.Party, 0, len(cfg.NodePorts))
+	parties := make([]tss.Party, 0, len(sortedPartyIDs))
 
 	// 2. --- Create and Register Parties ---
-	for i := 0; i < len(cfg.NodePorts); i++ {
-		params := tss.NewParameters(tss.S256(), tss.NewPeerContext(partyIDs), partyIDs[i], len(cfg.NodePorts), threshold)
-		outCh := make(chan tss.Message, len(cfg.NodePorts))
-		inCh := make(chan tss.ParsedMessage, len(cfg.NodePorts))
+	// In a real distributed setup, we would only create ONE party here - the local one.
+	// The other parties would be running on other machines.
+	// For this simulation, we create all of them.
+	for _, pID := range sortedPartyIDs {
+		params := tss.NewParameters(tss.S256(), tss.NewPeerContext(sortedPartyIDs), pID, len(sortedPartyIDs), threshold)
+		outCh := make(chan tss.Message, len(sortedPartyIDs))
+		inCh := make(chan tss.ParsedMessage, len(sortedPartyIDs))
 
 		p := keygen.NewLocalParty(params, outCh, endCh)
 		parties = append(parties, p)
 
-		party.DefaultRegistry.Register(nodePorts[i], inCh)
+		// Find the port for this party and register it
+		var partyPort string
+		if pID.Id == currentNode.Node {
+			partyPort = fmt.Sprintf(":%d", currentNode.Port)
+		} else {
+			for _, remoteParty := range currentNode.Parties {
+				if remoteParty.Name == pID.Id {
+					partyPort = ":" + remoteParty.Port
+					break
+				}
+			}
+		}
+		if partyPort == "" {
+			return nil, fmt.Errorf("could not find port for party %s", pID.Id)
+		}
+		party.DefaultRegistry.Register(partyPort, inCh)
 
 		// Start a goroutine to handle message transport for this party
 		go func(p tss.Party, pTransport network.Transport, pOutCh <-chan tss.Message, pInCh <-chan tss.ParsedMessage, pCtx context.Context) {
@@ -98,9 +149,9 @@ func GenerateAndSaveKey(cfg *config.Config) (*models.KeyData, error) {
 	}
 
 	// 4. --- Wait for all parties to finish ---
-	saveData := make([]*keygen.LocalPartySaveData, 0, len(cfg.NodePorts))
+	saveData := make([]*keygen.LocalPartySaveData, 0, len(sortedPartyIDs))
 	finishedParties := 0
-	for finishedParties < len(cfg.NodePorts) {
+	for finishedParties < len(sortedPartyIDs) {
 		select {
 		case save := <-endCh:
 			saveData = append(saveData, save)
@@ -108,8 +159,11 @@ func GenerateAndSaveKey(cfg *config.Config) (*models.KeyData, error) {
 		case err := <-errCh:
 			logger.Log.Errorf("Error during keygen: %v", err)
 			// Deregister all parties on error
-			for i := 0; i < len(cfg.NodePorts); i++ {
-				party.DefaultRegistry.Deregister(nodePorts[i])
+			for _, pID := range sortedPartyIDs {
+				port, ok := partyIDMap[pID.Id]
+				if ok {
+					party.DefaultRegistry.Deregister(port)
+				}
 			}
 			return nil, err
 		}
@@ -118,8 +172,9 @@ func GenerateAndSaveKey(cfg *config.Config) (*models.KeyData, error) {
 	startWg.Wait()
 
 	// Deregister all parties now that they are finished
-	for i := 0; i < len(cfg.NodePorts); i++ {
-		party.DefaultRegistry.Deregister(nodePorts[i])
+	for _, pConf := range allPartyConfs {
+		port := ":" + pConf.Port
+		party.DefaultRegistry.Deregister(port)
 	}
 
 	logger.Log.Info("Key generation successful!")
@@ -151,18 +206,20 @@ func GenerateAndSaveKey(cfg *config.Config) (*models.KeyData, error) {
 	}
 
 	for _, sd := range saveData {
-		// Find the party ID string for the given share
+		// Find the party ID string for the given share by matching the share ID
 		var pIDStr string
-		for _, pID := range partyIDs {
-			if pID.KeyInt().Cmp(sd.ShareID) == 0 {
-				pIDStr = pID.Id
+		partyIndex := -1
+		for i, k := range sd.Ks {
+			if k.Cmp(sd.ShareID) == 0 {
+				partyIndex = i
 				break
 			}
 		}
-		if pIDStr == "" {
+		if partyIndex == -1 {
 			tx.Rollback()
-			return nil, fmt.Errorf("could not find party ID for share")
+			return nil, fmt.Errorf("could not find party for share")
 		}
+		pIDStr = sortedPartyIDs[partyIndex].Id
 
 		shareBytes, err := json.Marshal(sd)
 		if err != nil {
@@ -195,7 +252,7 @@ func GenerateAndSaveKey(cfg *config.Config) (*models.KeyData, error) {
 	return &finalRecord, nil
 }
 
-func SignMessage(cfg *config.Config, keyID uuid.UUID, message string) (*common.SignatureData, error) {
+func SignMessage(cfg *config.Config, nodeName string, keyID uuid.UUID, message string) (*common.SignatureData, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -209,65 +266,84 @@ func SignMessage(cfg *config.Config, keyID uuid.UUID, message string) (*common.S
 		return nil, fmt.Errorf("no shares found for key with ID %s", keyID)
 	}
 
-	// 2. --- Deserialize Shares ---
-	saveData := make([]*keygen.LocalPartySaveData, len(keyRecord.Shares))
-	for i, share := range keyRecord.Shares {
+	// 2. --- Deserialize Shares into a map for easy lookup ---
+	saveDataMap := make(map[string]*keygen.LocalPartySaveData, len(keyRecord.Shares))
+	for _, share := range keyRecord.Shares {
 		var shareData keygen.LocalPartySaveData
 		if err := json.Unmarshal(share.ShareData, &shareData); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal share data for party %s: %v", share.PartyID, err)
 		}
-		saveData[i] = &shareData
+		saveDataMap[share.PartyID] = &shareData
 	}
 
 	// 3. --- Setup Signing Parties ---
-	partyIDs := make(tss.UnSortedPartyIDs, len(saveData))
-	partyIDMap := make(map[string]string, len(cfg.NodePorts))
-	for i, sd := range saveData {
-		pID := tss.NewPartyID(keyRecord.Shares[i].PartyID, keyRecord.Shares[i].PartyID, sd.ShareID)
-		partyIDs[i] = pID
-		// Find the corresponding port for the party ID
-		for j, nodePID := range tss.GenerateTestPartyIDs(len(cfg.NodePorts)) {
-			if nodePID.Id == pID.Id {
-				partyIDMap[pID.Id] = cfg.NodePorts[j]
-				break
-			}
+	// Find the configuration for the current node
+	var currentNode *config.Node
+	for _, node := range cfg.Nodes {
+		if node.Node == nodeName {
+			currentNode = &node
+			break
 		}
 	}
+	if currentNode == nil {
+		return nil, fmt.Errorf("configuration for node '%s' not found", nodeName)
+	}
 
-	signingPartyIDs := partyIDs[:keyRecord.Threshold+1]
-	sortedSigningPartyIDs := tss.SortPartyIDs(signingPartyIDs)
+	allPartyConfs := append(currentNode.Parties, config.Party{
+		Name:   currentNode.Node,
+		Port:   fmt.Sprintf("%d", currentNode.Port),
+		Server: "127.0.0.1", // Assuming self is always local
+	})
 
-	errCh := make(chan *tss.Error, len(signingPartyIDs))
-	endCh := make(chan *common.SignatureData, len(signingPartyIDs))
+	partyIDMap := make(map[string]string, len(allPartyConfs))
+	for _, p := range allPartyConfs {
+		partyIDMap[p.Name] = net.JoinHostPort(p.Server, p.Port)
+	}
+
+	// Reconstruct PartyIDs from the saved data map
+	partyIDs := make(tss.UnSortedPartyIDs, 0, len(saveDataMap))
+	for partyName, sd := range saveDataMap {
+		partyIDs = append(partyIDs, tss.NewPartyID(partyName, partyName, sd.ShareID))
+	}
+	sortedSigningPartyIDs := tss.SortPartyIDs(partyIDs)
+
+	errCh := make(chan *tss.Error, len(sortedSigningPartyIDs))
+	endCh := make(chan *common.SignatureData, len(sortedSigningPartyIDs))
 	transport := network.NewTCPTransport(partyIDMap)
-	signingParties := make([]tss.Party, 0, len(signingPartyIDs))
+	signingParties := make([]tss.Party, 0, len(sortedSigningPartyIDs))
 
 	hash := sha256.Sum256([]byte(message))
 	msgToSign := new(big.Int).SetBytes(hash[:])
 
-	for _, pID := range signingPartyIDs {
-		params := tss.NewParameters(tss.S256(), tss.NewPeerContext(sortedSigningPartyIDs), pID, len(signingPartyIDs), keyRecord.Threshold)
-		var localSaveData keygen.LocalPartySaveData
-		for i, share := range keyRecord.Shares {
-			if keyRecord.Shares[i].PartyID == pID.Id {
-				if err := json.Unmarshal(share.ShareData, &localSaveData); err != nil {
-					return nil, fmt.Errorf("failed to unmarshal share data for party %s: %v", pID.Id, err)
-				}
-				break
-			}
+	for _, pID := range sortedSigningPartyIDs {
+		params := tss.NewParameters(tss.S256(), tss.NewPeerContext(sortedSigningPartyIDs), pID, len(sortedSigningPartyIDs), keyRecord.Threshold)
+
+		localSaveData, ok := saveDataMap[pID.Id]
+		if !ok || localSaveData.ShareID == nil {
+			return nil, fmt.Errorf("could not find local save data for party %s", pID.Id)
 		}
 
-		outCh := make(chan tss.Message, len(signingPartyIDs))
-		inCh := make(chan tss.ParsedMessage, len(signingPartyIDs))
-		localParty := signing.NewLocalParty(msgToSign, params, localSaveData, outCh, endCh)
+		outCh := make(chan tss.Message, len(sortedSigningPartyIDs))
+		inCh := make(chan tss.ParsedMessage, len(sortedSigningPartyIDs))
+		localParty := signing.NewLocalParty(msgToSign, params, *localSaveData, outCh, endCh)
 		signingParties = append(signingParties, localParty)
 
 		// Register party for message routing
-		port, ok := partyIDMap[pID.Id]
-		if !ok {
-			return nil, fmt.Errorf("no port found for party %s", pID.Id)
+		var partyPort string
+		if pID.Id == currentNode.Node {
+			partyPort = fmt.Sprintf(":%d", currentNode.Port)
+		} else {
+			for _, remoteParty := range currentNode.Parties {
+				if remoteParty.Name == pID.Id {
+					partyPort = ":" + remoteParty.Port
+					break
+				}
+			}
 		}
-		party.DefaultRegistry.Register(port, inCh)
+		if partyPort == "" {
+			return nil, fmt.Errorf("could not find port for party %s", pID.Id)
+		}
+		party.DefaultRegistry.Register(partyPort, inCh)
 
 		go func(p tss.Party, pTransport network.Transport, pOutCh <-chan tss.Message, pInCh <-chan tss.ParsedMessage, pCtx context.Context) {
 			defer logger.Log.Infof("Party %s transport goroutine finished.", p.PartyID())
@@ -304,18 +380,17 @@ func SignMessage(cfg *config.Config, keyID uuid.UUID, message string) (*common.S
 
 	var signature *common.SignatureData
 	finishedSigners := 0
-	for finishedSigners < len(signingPartyIDs) {
+	for finishedSigners < len(sortedSigningPartyIDs) {
 		select {
 		case sig := <-endCh:
 			signature = sig
 			finishedSigners++
 		case err := <-errCh:
 			logger.Log.Errorf("Error during signing: %v", err)
-			for _, pID := range signingPartyIDs {
-				port, ok := partyIDMap[pID.Id]
-				if ok {
-					party.DefaultRegistry.Deregister(port)
-				}
+			// Deregister all parties now that they are finished
+			for _, pConf := range allPartyConfs {
+				port := ":" + pConf.Port
+				party.DefaultRegistry.Deregister(port)
 			}
 			return nil, err
 		}
@@ -323,7 +398,7 @@ func SignMessage(cfg *config.Config, keyID uuid.UUID, message string) (*common.S
 
 	startWg.Wait()
 
-	for _, pID := range signingPartyIDs {
+	for _, pID := range sortedSigningPartyIDs {
 		port, ok := partyIDMap[pID.Id]
 		if ok {
 			party.DefaultRegistry.Deregister(port)

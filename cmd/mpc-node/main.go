@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"mpc-node/api"
 	"mpc-node/internal/config"
 	"mpc-node/internal/logger"
@@ -81,19 +82,23 @@ func main() {
 		logger.Log.Fatalf("Failed to initialize logger: %v", err)
 	}
 
-	logger.Log.Info("Configuration loaded and logger initialized.")
+	logger.Log.Info("Configuration loaded.")
 
 	// Initialize database
 	storage.InitDB(cfg.Database)
 	logger.Log.Info("Database initialized.")
 
-	// Start TCP servers for TSS nodes based on config
-	for _, port := range cfg.NodePorts {
-		go startTCPServer(port)
+	// Start TCP servers for all nodes for local debugging
+	for _, node := range cfg.Nodes {
+		listenAddr := fmt.Sprintf(":%d", node.Port)
+		go startTCPServer(listenAddr)
 	}
 
-	router := api.SetupRouter(cfg)
-	logger.Log.Infof("Starting server on port %s", cfg.ServerPort)
+	// We'll run the API from the perspective of the first node for now.
+	// In a real scenario, each node would have its own API server.
+	nodeName := cfg.Nodes[0].Node
+	router := api.SetupRouter(cfg, nodeName)
+	logger.Log.Infof("Starting API server on port %s (acting as node %s)", cfg.ServerPort, nodeName)
 	if err := router.Run(cfg.ServerPort); err != nil {
 		logger.Log.Fatalf("Failed to start server: %v", err)
 	}

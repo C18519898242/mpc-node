@@ -8,19 +8,20 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ConfigMiddleware adds the config to the context
-func ConfigMiddleware(cfg *config.Config) gin.HandlerFunc {
+// AppContextMiddleware adds the config and nodeName to the context
+func AppContextMiddleware(cfg *config.Config, nodeName string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Set("config", cfg)
+		c.Set("nodeName", nodeName)
 		c.Next()
 	}
 }
 
-func SetupRouter(cfg *config.Config) *gin.Engine {
+func SetupRouter(cfg *config.Config, nodeName string) *gin.Engine {
 	router := gin.Default()
 
-	// Use the config middleware for all routes
-	router.Use(ConfigMiddleware(cfg))
+	// Use the app context middleware for all routes
+	router.Use(AppContextMiddleware(cfg, nodeName))
 
 	router.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{

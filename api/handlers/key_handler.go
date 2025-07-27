@@ -53,7 +53,25 @@ func GenerateKey(c *gin.Context) {
 		return
 	}
 
-	keyRecord, err := tss.GenerateAndSaveKey(appConfig)
+	// Retrieve the nodeName from the context
+	nodeName, exists := c.Get("nodeName")
+	if !exists {
+		logger.Log.Error("Node name not found in context")
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Server configuration error: node name missing",
+		})
+		return
+	}
+	nodeNameStr, ok := nodeName.(string)
+	if !ok {
+		logger.Log.Error("Invalid node name type in context")
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Invalid server configuration: node name type",
+		})
+		return
+	}
+
+	keyRecord, err := tss.GenerateAndSaveKey(appConfig, nodeNameStr)
 	if err != nil {
 		logger.Log.Errorf("Failed to generate key: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -135,6 +153,24 @@ func SignMessage(c *gin.Context) {
 		return
 	}
 
+	// Retrieve the nodeName from the context
+	nodeName, exists := c.Get("nodeName")
+	if !exists {
+		logger.Log.Error("Node name not found in context")
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Server configuration error: node name missing",
+		})
+		return
+	}
+	nodeNameStr, ok := nodeName.(string)
+	if !ok {
+		logger.Log.Error("Invalid node name type in context")
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Invalid server configuration: node name type",
+		})
+		return
+	}
+
 	keyUUID, err := uuid.Parse(req.KeyID)
 	if err != nil {
 		logger.Log.Errorf("Invalid KeyID format: %s", req.KeyID)
@@ -142,7 +178,7 @@ func SignMessage(c *gin.Context) {
 		return
 	}
 
-	signature, err := tss.SignMessage(appConfig, keyUUID, req.Message)
+	signature, err := tss.SignMessage(appConfig, nodeNameStr, keyUUID, req.Message)
 	if err != nil {
 		logger.Log.Errorf("Failed to sign message for key %s: %v", req.KeyID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to sign message: " + err.Error()})
