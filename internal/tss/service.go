@@ -195,7 +195,10 @@ func GenerateAndSaveKey(cfg *config.Config) (*models.KeyData, error) {
 	return &finalRecord, nil
 }
 
-func SignMessage(keyID uuid.UUID, message string) (*common.SignatureData, error) {
+func SignMessage(cfg *config.Config, keyID uuid.UUID, message string) (*common.SignatureData, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// 1. --- Load Key and Shares from DB ---
 	var keyRecord models.KeyData
 	err := storage.DB.Preload("Shares").First(&keyRecord, "key_id = ?", keyID).Error
@@ -217,106 +220,114 @@ func SignMessage(keyID uuid.UUID, message string) (*common.SignatureData, error)
 	}
 
 	// 3. --- Setup Signing Parties ---
-	// Reconstruct PartyIDs from the saved data instead of generating new ones
 	partyIDs := make(tss.UnSortedPartyIDs, len(saveData))
-	saveDataMap := make(map[string]*keygen.LocalPartySaveData, len(saveData))
+	partyIDMap := make(map[string]string, len(cfg.NodePorts))
 	for i, sd := range saveData {
-		// The PartyID is not saved in keygen.LocalPartySaveData, but the ShareID (pID.Key) is.
-		// We stored the party ID string in our KeyShare model.
 		pID := tss.NewPartyID(keyRecord.Shares[i].PartyID, keyRecord.Shares[i].PartyID, sd.ShareID)
 		partyIDs[i] = pID
-		saveDataMap[pID.Id] = sd
+		// Find the corresponding port for the party ID
+		for j, nodePID := range tss.GenerateTestPartyIDs(len(cfg.NodePorts)) {
+			if nodePID.Id == pID.Id {
+				partyIDMap[pID.Id] = cfg.NodePorts[j]
+				break
+			}
+		}
 	}
 
 	signingPartyIDs := partyIDs[:keyRecord.Threshold+1]
+	sortedSigningPartyIDs := tss.SortPartyIDs(signingPartyIDs)
 
-	signOutCh := make(chan tss.Message, len(signingPartyIDs)*len(signingPartyIDs))
-	signEndCh := make(chan *common.SignatureData, len(signingPartyIDs))
-	signErrCh := make(chan *tss.Error, len(signingPartyIDs)*len(signingPartyIDs))
-
-	var signWg sync.WaitGroup
-	signWg.Add(len(signingPartyIDs))
+	errCh := make(chan *tss.Error, len(signingPartyIDs))
+	endCh := make(chan *common.SignatureData, len(signingPartyIDs))
+	transport := network.NewTCPTransport(partyIDMap)
+	signingParties := make([]tss.Party, 0, len(signingPartyIDs))
 
 	hash := sha256.Sum256([]byte(message))
 	msgToSign := new(big.Int).SetBytes(hash[:])
 
-	signingParties := make(map[*tss.PartyID]tss.Party, len(signingPartyIDs))
-	sortedSigningPartyIDs := tss.SortPartyIDs(signingPartyIDs)
 	for _, pID := range signingPartyIDs {
 		params := tss.NewParameters(tss.S256(), tss.NewPeerContext(sortedSigningPartyIDs), pID, len(signingPartyIDs), keyRecord.Threshold)
-		// Look up the correct save data from our map
-		localSaveData, ok := saveDataMap[pID.Id]
-		if !ok {
-			return nil, fmt.Errorf("could not find save data for party %s", pID.Id)
-		}
-		party := signing.NewLocalParty(msgToSign, params, *localSaveData, signOutCh, signEndCh)
-		signingParties[pID] = party
-		go func(p tss.Party) {
-			defer signWg.Done()
-			if err := p.Start(); err != nil {
-				signErrCh <- err
+		var localSaveData keygen.LocalPartySaveData
+		for i, share := range keyRecord.Shares {
+			if keyRecord.Shares[i].PartyID == pID.Id {
+				if err := json.Unmarshal(share.ShareData, &localSaveData); err != nil {
+					return nil, fmt.Errorf("failed to unmarshal share data for party %s: %v", pID.Id, err)
+				}
+				break
 			}
-		}(party)
+		}
+
+		outCh := make(chan tss.Message, len(signingPartyIDs))
+		inCh := make(chan tss.ParsedMessage, len(signingPartyIDs))
+		localParty := signing.NewLocalParty(msgToSign, params, localSaveData, outCh, endCh)
+		signingParties = append(signingParties, localParty)
+
+		// Register party for message routing
+		port, ok := partyIDMap[pID.Id]
+		if !ok {
+			return nil, fmt.Errorf("no port found for party %s", pID.Id)
+		}
+		party.DefaultRegistry.Register(port, inCh)
+
+		go func(p tss.Party, pTransport network.Transport, pOutCh <-chan tss.Message, pInCh <-chan tss.ParsedMessage, pCtx context.Context) {
+			defer logger.Log.Infof("Party %s transport goroutine finished.", p.PartyID())
+			for {
+				select {
+				case msg := <-pOutCh:
+					if err := pTransport.Send(msg); err != nil {
+						errCh <- p.WrapError(err)
+						return
+					}
+				case msg := <-pInCh:
+					go func(p tss.Party, msg tss.ParsedMessage) {
+						if _, err := p.Update(msg); err != nil {
+							errCh <- p.WrapError(err)
+						}
+					}(p, msg)
+				case <-pCtx.Done():
+					return
+				}
+			}
+		}(localParty, transport, outCh, inCh, ctx)
 	}
 
-	// 4. --- Network Simulation (Signing) ---
+	var startWg sync.WaitGroup
+	startWg.Add(len(signingParties))
+	for _, p := range signingParties {
+		go func(p tss.Party) {
+			defer startWg.Done()
+			if err := p.Start(); err != nil {
+				errCh <- err
+			}
+		}(p)
+	}
+
 	var signature *common.SignatureData
 	finishedSigners := 0
 	for finishedSigners < len(signingPartyIDs) {
 		select {
-		case msg := <-signOutCh:
-			logger.Log.Infof("[TSS Signing] Received message: Type=%s, From=%s, To=%v, Broadcast=%v", msg.Type(), msg.GetFrom(), msg.GetTo(), msg.IsBroadcast())
-			bz, _, err := msg.WireBytes()
-			if err != nil {
-				signErrCh <- tss.NewError(err, "SignAndVerify", 0, msg.GetFrom())
-				continue
-			}
-			pMsg, err := tss.ParseWireMessage(bz, msg.GetFrom(), msg.IsBroadcast())
-			if err != nil {
-				signErrCh <- tss.NewError(err, "SignAndVerify", 0, msg.GetFrom())
-				continue
-			}
-			dest := msg.GetTo()
-			if dest == nil {
-				// broadcast
-				for _, pID := range signingPartyIDs {
-					if pID == msg.GetFrom() {
-						continue
-					}
-					logger.Log.Infof("[TSS Signing] Relaying broadcast message from %s to %s", msg.GetFrom(), pID)
-					go func(p tss.Party) {
-						if _, err := p.Update(pMsg); err != nil {
-							signErrCh <- err
-						}
-					}(signingParties[pID])
-				}
-			} else {
-				// point-to-point
-				for _, pID := range dest {
-					if pID == msg.GetFrom() {
-						continue
-					}
-					logger.Log.Infof("[TSS Signing] Relaying p2p message from %s to %s", msg.GetFrom(), pID)
-					go func(p tss.Party) {
-						if _, err := p.Update(pMsg); err != nil {
-							signErrCh <- err
-						}
-					}(signingParties[pID])
-				}
-			}
-		case sig := <-signEndCh:
+		case sig := <-endCh:
 			signature = sig
 			finishedSigners++
-		case err := <-signErrCh:
-			return nil, fmt.Errorf("error during signing: %v", err)
+		case err := <-errCh:
+			logger.Log.Errorf("Error during signing: %v", err)
+			for _, pID := range signingPartyIDs {
+				port, ok := partyIDMap[pID.Id]
+				if ok {
+					party.DefaultRegistry.Deregister(port)
+				}
+			}
+			return nil, err
 		}
 	}
-	signWg.Wait()
 
-	// Close the error channel and check for any remaining errors
-	close(signErrCh)
-	for err := range signErrCh {
-		return nil, fmt.Errorf("error received after wait: %v", err)
+	startWg.Wait()
+
+	for _, pID := range signingPartyIDs {
+		port, ok := partyIDMap[pID.Id]
+		if ok {
+			party.DefaultRegistry.Deregister(port)
+		}
 	}
 
 	return signature, nil
