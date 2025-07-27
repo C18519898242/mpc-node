@@ -71,7 +71,7 @@ func handleTCPConnection(conn net.Conn) {
 
 func main() {
 	// Load configuration
-	cfg, err := config.LoadConfig("../config.json")
+	cfg, err := config.LoadConfig("config.json")
 	if err != nil {
 		logger.Log.Fatalf("Failed to load configuration: %v", err)
 	}
