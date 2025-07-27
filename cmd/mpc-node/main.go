@@ -1,12 +1,16 @@
 package main
 
 import (
-	"io"
+	"encoding/json"
 	"mpc-node/api"
 	"mpc-node/internal/config"
 	"mpc-node/internal/logger"
+	"mpc-node/internal/party"
 	"mpc-node/internal/storage"
 	"net"
+	"strings"
+
+	"github.com/bnb-chain/tss-lib/v2/tss"
 )
 
 func startTCPServer(listenAddr string) {
@@ -27,21 +31,42 @@ func startTCPServer(listenAddr string) {
 	}
 }
 
+// WireMessage is the format of messages sent over the TCP connection.
+type WireMessage struct {
+	From        *tss.PartyID
+	IsBroadcast bool
+	Payload     []byte
+}
+
 func handleTCPConnection(conn net.Conn) {
 	defer conn.Close()
-	logger.Log.Infof("Accepted TCP connection from %s", conn.RemoteAddr())
-	buf := make([]byte, 1024)
-	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				logger.Log.Errorf("TCP read error: %v", err)
-			}
-			return
-		}
-		message := string(buf[:n])
-		logger.Log.Infof("Received message from %s: %s", conn.RemoteAddr(), message)
+	localAddr := conn.LocalAddr().String()
+	// a bit of a hack to get the port, e.g. "127.0.0.1:8001" -> ":8001"
+	port := ":" + strings.Split(localAddr, ":")[1]
+
+	logger.Log.Infof("Accepted TCP connection on %s from %s", port, conn.RemoteAddr())
+
+	decoder := json.NewDecoder(conn)
+	var wireMsg WireMessage
+	if err := decoder.Decode(&wireMsg); err != nil {
+		logger.Log.Errorf("Failed to decode wire message on %s: %v", port, err)
+		return
 	}
+
+	pMsg, err := tss.ParseWireMessage(wireMsg.Payload, wireMsg.From, wireMsg.IsBroadcast)
+	if err != nil {
+		logger.Log.Errorf("Failed to parse TSS message on %s: %v", port, err)
+		return
+	}
+
+	partyCh, ok := party.DefaultRegistry.Get(port)
+	if !ok {
+		logger.Log.Errorf("No party found for address %s. Cannot route message.", port)
+		return
+	}
+
+	logger.Log.Infof("Routing message from %s to party on %s", wireMsg.From.Id, port)
+	partyCh <- pMsg
 }
 
 func main() {

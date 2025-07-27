@@ -1,6 +1,7 @@
 package tss
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,8 @@ import (
 	"fmt"
 	"math/big"
 	"mpc-node/internal/logger"
+	"mpc-node/internal/network"
+	"mpc-node/internal/party"
 	"mpc-node/internal/storage"
 	"mpc-node/internal/storage/models"
 	"strings"
@@ -25,101 +28,97 @@ const (
 	threshold    = 1
 )
 
-// GenerateAndSaveKey performs the TSS key generation and saves the result to the database.
-// It returns the newly created key record.
+// GenerateAndSaveKey performs the TSS key generation using real network communication
+// and saves the result to the database.
 func GenerateAndSaveKey() (*models.KeyData, error) {
-	// 1. --- Setup ---
+	logger.Log.Info("--- Phase 1: Setup for Real Network Key Generation ---")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Ensure all goroutines are signalled to stop when we exit
+
+	// 1. --- Party and Network Setup ---
 	partyIDs := tss.GenerateTestPartyIDs(partiesCount)
-	outCh := make(chan tss.Message, partiesCount*partiesCount)
+	partyIDMap := make(map[string]string, partiesCount)
+	nodePorts := []string{":8001", ":8002", ":8003"}
+	for i, pID := range partyIDs {
+		partyIDMap[pID.Id] = nodePorts[i]
+	}
+
+	errCh := make(chan *tss.Error, partiesCount)
 	endCh := make(chan *keygen.LocalPartySaveData, partiesCount)
-	errCh := make(chan *tss.Error, partiesCount*partiesCount)
 
-	var wg sync.WaitGroup
-	wg.Add(partiesCount)
+	transport := network.NewTCPTransport(partyIDMap)
+	parties := make([]tss.Party, 0, partiesCount)
 
-	parties := make(map[*tss.PartyID]tss.Party, partiesCount)
-	saveData := make([]*keygen.LocalPartySaveData, partiesCount)
-
-	logger.Log.Info("--- Phase 1: Key Generation ---")
-
-	// 2. --- Key Generation ---
+	// 2. --- Create and Register Parties ---
 	for i := 0; i < partiesCount; i++ {
-		ctx := tss.NewPeerContext(partyIDs)
-		params := tss.NewParameters(tss.S256(), ctx, partyIDs[i], partiesCount, threshold)
-		party := keygen.NewLocalParty(params, outCh, endCh)
-		parties[partyIDs[i]] = party
+		params := tss.NewParameters(tss.S256(), tss.NewPeerContext(partyIDs), partyIDs[i], partiesCount, threshold)
+		outCh := make(chan tss.Message, partiesCount)
+		inCh := make(chan tss.ParsedMessage, partiesCount)
+
+		p := keygen.NewLocalParty(params, outCh, endCh)
+		parties = append(parties, p)
+
+		party.DefaultRegistry.Register(nodePorts[i], inCh)
+
+		// Start a goroutine to handle message transport for this party
+		go func(p tss.Party, pTransport network.Transport, pOutCh <-chan tss.Message, pInCh <-chan tss.ParsedMessage, pCtx context.Context) {
+			defer logger.Log.Infof("Party %s transport goroutine finished.", p.PartyID())
+			for {
+				select {
+				case msg := <-pOutCh:
+					if err := pTransport.Send(msg); err != nil {
+						errCh <- p.WrapError(err)
+						return
+					}
+				case msg := <-pInCh:
+					// The `Update` method may block, so we run it in a new goroutine
+					go func(p tss.Party, msg tss.ParsedMessage) {
+						if _, err := p.Update(msg); err != nil {
+							errCh <- p.WrapError(err)
+						}
+					}(p, msg)
+				case <-pCtx.Done():
+					return
+				}
+			}
+		}(p, transport, outCh, inCh, ctx)
+	}
+
+	// 3. --- Start all parties ---
+	var startWg sync.WaitGroup
+	startWg.Add(len(parties))
+	for _, p := range parties {
 		go func(p tss.Party) {
-			defer wg.Done()
+			defer startWg.Done()
 			if err := p.Start(); err != nil {
 				errCh <- err
 			}
-		}(party)
+		}(p)
 	}
 
-	// 3. --- Network Simulation (Key Generation) ---
+	// 4. --- Wait for all parties to finish ---
+	saveData := make([]*keygen.LocalPartySaveData, 0, partiesCount)
 	finishedParties := 0
 	for finishedParties < partiesCount {
 		select {
-		case msg := <-outCh:
-			logger.Log.Infof("[TSS KeyGen] Received message: Type=%s, From=%s, To=%v, Broadcast=%v", msg.Type(), msg.GetFrom(), msg.GetTo(), msg.IsBroadcast())
-			bz, _, err := msg.WireBytes()
-			if err != nil {
-				return nil, fmt.Errorf("error getting wire bytes: %v", err)
-			}
-			parsedMsg, err := tss.ParseWireMessage(bz, msg.GetFrom(), msg.IsBroadcast())
-			if err != nil {
-				return nil, fmt.Errorf("error parsing message: %v", err)
-			}
-			logger.Log.Infof("[TSS KeyGen] Parsed message content: %+v", parsedMsg)
-			dest := msg.GetTo()
-			if dest == nil { // broadcast
-				for _, pID := range partyIDs {
-					if pID == msg.GetFrom() {
-						continue
-					}
-					logger.Log.Infof("[TSS KeyGen] Relaying broadcast message from %s to %s", msg.GetFrom(), pID)
-					go func(p tss.Party) {
-						if _, err := p.Update(parsedMsg); err != nil {
-							errCh <- err
-						}
-					}(parties[pID])
-				}
-			} else { // point-to-point
-				for _, pID := range dest {
-					if pID == msg.GetFrom() {
-						continue
-					}
-					logger.Log.Infof("[TSS KeyGen] Relaying p2p message from %s to %s", msg.GetFrom(), pID)
-					go func(p tss.Party) {
-						if _, err := p.Update(parsedMsg); err != nil {
-							errCh <- err
-						}
-					}(parties[pID])
-				}
-			}
 		case save := <-endCh:
-			var found bool
-			for i, pID := range partyIDs {
-				if pID.KeyInt().Cmp(save.ShareID) == 0 {
-					saveData[i] = save
-					found = true
-					break
-				}
-			}
-			if !found {
-				return nil, fmt.Errorf("could not find party for save data")
-			}
+			saveData = append(saveData, save)
 			finishedParties++
 		case err := <-errCh:
-			return nil, fmt.Errorf("error in keygen: %v", err)
+			logger.Log.Errorf("Error during keygen: %v", err)
+			// Deregister all parties on error
+			for i := 0; i < partiesCount; i++ {
+				party.DefaultRegistry.Deregister(nodePorts[i])
+			}
+			return nil, err
 		}
 	}
 
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		logger.Log.Errorf("Error received after wait: %v", err)
-		return nil, fmt.Errorf("error received after wait: %v", err)
+	startWg.Wait()
+
+	// Deregister all parties now that they are finished
+	for i := 0; i < partiesCount; i++ {
+		party.DefaultRegistry.Deregister(nodePorts[i])
 	}
 
 	logger.Log.Info("Key generation successful!")
@@ -139,33 +138,44 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 		Threshold: threshold,
 	}
 
-	// Use a transaction to ensure atomicity
+	// 5. --- Save results to DB ---
 	tx := storage.DB.Begin()
 	if tx.Error != nil {
 		return nil, fmt.Errorf("failed to begin transaction: %v", tx.Error)
 	}
 
-	// Create the main key record
 	if err := tx.Create(&keyRecord).Error; err != nil {
 		tx.Rollback()
 		return nil, fmt.Errorf("failed to create key record: %v", err)
 	}
 
-	// Create a share record for each party
-	for i, pID := range partyIDs {
-		shareBytes, err := json.Marshal(saveData[i])
+	for _, sd := range saveData {
+		// Find the party ID string for the given share
+		var pIDStr string
+		for _, pID := range partyIDs {
+			if pID.KeyInt().Cmp(sd.ShareID) == 0 {
+				pIDStr = pID.Id
+				break
+			}
+		}
+		if pIDStr == "" {
+			tx.Rollback()
+			return nil, fmt.Errorf("could not find party ID for share")
+		}
+
+		shareBytes, err := json.Marshal(sd)
 		if err != nil {
 			tx.Rollback()
-			return nil, fmt.Errorf("failed to marshal share data for party %s: %v", pID.Id, err)
+			return nil, fmt.Errorf("failed to marshal share data for party %s: %v", pIDStr, err)
 		}
 		keyShare := models.KeyShare{
-			KeyDataID: keyRecord.KeyID, // Link to the parent key using UUID
+			KeyDataID: keyRecord.KeyID,
 			ShareData: shareBytes,
-			PartyID:   pID.Id,
+			PartyID:   pIDStr,
 		}
 		if err := tx.Create(&keyShare).Error; err != nil {
 			tx.Rollback()
-			return nil, fmt.Errorf("failed to create key share for party %s: %v", pID.Id, err)
+			return nil, fmt.Errorf("failed to create key share for party %s: %v", pIDStr, err)
 		}
 	}
 
@@ -175,8 +185,6 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 
 	logger.Log.Info("Key and shares successfully saved to database.")
 
-	// Preload the shares for the return value
-	// We need to query by the UUID now to get the full record with shares
 	var finalRecord models.KeyData
 	err := storage.DB.Preload("Shares").First(&finalRecord, "key_id = ?", keyRecord.KeyID).Error
 	if err != nil {
