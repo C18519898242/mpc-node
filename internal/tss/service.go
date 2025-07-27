@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"mpc-node/internal/config"
 	"mpc-node/internal/logger"
 	"mpc-node/internal/network"
 	"mpc-node/internal/party"
@@ -30,30 +31,30 @@ const (
 
 // GenerateAndSaveKey performs the TSS key generation using real network communication
 // and saves the result to the database.
-func GenerateAndSaveKey() (*models.KeyData, error) {
+func GenerateAndSaveKey(cfg *config.Config) (*models.KeyData, error) {
 	logger.Log.Info("--- Phase 1: Setup for Real Network Key Generation ---")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // Ensure all goroutines are signalled to stop when we exit
 
 	// 1. --- Party and Network Setup ---
-	partyIDs := tss.GenerateTestPartyIDs(partiesCount)
-	partyIDMap := make(map[string]string, partiesCount)
-	nodePorts := []string{":8001", ":8002", ":8003"}
+	partyIDs := tss.GenerateTestPartyIDs(len(cfg.NodePorts))
+	partyIDMap := make(map[string]string, len(cfg.NodePorts))
+	nodePorts := cfg.NodePorts
 	for i, pID := range partyIDs {
 		partyIDMap[pID.Id] = nodePorts[i]
 	}
 
-	errCh := make(chan *tss.Error, partiesCount)
-	endCh := make(chan *keygen.LocalPartySaveData, partiesCount)
+	errCh := make(chan *tss.Error, len(cfg.NodePorts))
+	endCh := make(chan *keygen.LocalPartySaveData, len(cfg.NodePorts))
 
 	transport := network.NewTCPTransport(partyIDMap)
-	parties := make([]tss.Party, 0, partiesCount)
+	parties := make([]tss.Party, 0, len(cfg.NodePorts))
 
 	// 2. --- Create and Register Parties ---
-	for i := 0; i < partiesCount; i++ {
-		params := tss.NewParameters(tss.S256(), tss.NewPeerContext(partyIDs), partyIDs[i], partiesCount, threshold)
-		outCh := make(chan tss.Message, partiesCount)
-		inCh := make(chan tss.ParsedMessage, partiesCount)
+	for i := 0; i < len(cfg.NodePorts); i++ {
+		params := tss.NewParameters(tss.S256(), tss.NewPeerContext(partyIDs), partyIDs[i], len(cfg.NodePorts), threshold)
+		outCh := make(chan tss.Message, len(cfg.NodePorts))
+		inCh := make(chan tss.ParsedMessage, len(cfg.NodePorts))
 
 		p := keygen.NewLocalParty(params, outCh, endCh)
 		parties = append(parties, p)
@@ -97,9 +98,9 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 	}
 
 	// 4. --- Wait for all parties to finish ---
-	saveData := make([]*keygen.LocalPartySaveData, 0, partiesCount)
+	saveData := make([]*keygen.LocalPartySaveData, 0, len(cfg.NodePorts))
 	finishedParties := 0
-	for finishedParties < partiesCount {
+	for finishedParties < len(cfg.NodePorts) {
 		select {
 		case save := <-endCh:
 			saveData = append(saveData, save)
@@ -107,7 +108,7 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 		case err := <-errCh:
 			logger.Log.Errorf("Error during keygen: %v", err)
 			// Deregister all parties on error
-			for i := 0; i < partiesCount; i++ {
+			for i := 0; i < len(cfg.NodePorts); i++ {
 				party.DefaultRegistry.Deregister(nodePorts[i])
 			}
 			return nil, err
@@ -117,7 +118,7 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 	startWg.Wait()
 
 	// Deregister all parties now that they are finished
-	for i := 0; i < partiesCount; i++ {
+	for i := 0; i < len(cfg.NodePorts); i++ {
 		party.DefaultRegistry.Deregister(nodePorts[i])
 	}
 

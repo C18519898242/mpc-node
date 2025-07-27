@@ -71,7 +71,7 @@ func handleTCPConnection(conn net.Conn) {
 
 func main() {
 	// Load configuration
-	cfg, err := config.LoadConfig("config.json")
+	cfg, err := config.LoadConfig("../config.json")
 	if err != nil {
 		logger.Log.Fatalf("Failed to load configuration: %v", err)
 	}
@@ -87,11 +87,12 @@ func main() {
 	storage.InitDB(cfg.Database)
 	logger.Log.Info("Database initialized.")
 
-	go startTCPServer(":8001")
-	go startTCPServer(":8002")
-	go startTCPServer(":8003")
+	// Start TCP servers for TSS nodes based on config
+	for _, port := range cfg.NodePorts {
+		go startTCPServer(port)
+	}
 
-	router := api.SetupRouter()
+	router := api.SetupRouter(cfg)
 	logger.Log.Infof("Starting server on port %s", cfg.ServerPort)
 	if err := router.Run(cfg.ServerPort); err != nil {
 		logger.Log.Fatalf("Failed to start server: %v", err)

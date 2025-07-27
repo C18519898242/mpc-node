@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/base64"
+	"mpc-node/internal/config"
 	"mpc-node/internal/logger"
 	"mpc-node/internal/storage"
 	"mpc-node/internal/storage/models"
@@ -34,7 +35,25 @@ type VerifyRequest struct {
 }
 
 func GenerateKey(c *gin.Context) {
-	keyRecord, err := tss.GenerateAndSaveKey()
+	// Retrieve the config from the context
+	cfg, exists := c.Get("config")
+	if !exists {
+		logger.Log.Error("Config not found in context")
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Server configuration error",
+		})
+		return
+	}
+	appConfig, ok := cfg.(*config.Config)
+	if !ok {
+		logger.Log.Error("Invalid config type in context")
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Invalid server configuration",
+		})
+		return
+	}
+
+	keyRecord, err := tss.GenerateAndSaveKey(appConfig)
 	if err != nil {
 		logger.Log.Errorf("Failed to generate key: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{

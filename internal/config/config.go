@@ -26,6 +26,7 @@ type LoggerConfig struct {
 // Config holds the application's configuration values.
 type Config struct {
 	ServerPort string       `json:"server_port"`
+	NodePorts  []string     `json:"node_ports"`
 	Database   DBConfig     `json:"database"`
 	Logger     LoggerConfig `json:"logger"`
 }

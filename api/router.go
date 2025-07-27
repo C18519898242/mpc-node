@@ -2,13 +2,25 @@ package api
 
 import (
 	"mpc-node/api/handlers"
+	"mpc-node/internal/config"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 )
 
-func SetupRouter() *gin.Engine {
+// ConfigMiddleware adds the config to the context
+func ConfigMiddleware(cfg *config.Config) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Set("config", cfg)
+		c.Next()
+	}
+}
+
+func SetupRouter(cfg *config.Config) *gin.Engine {
 	router := gin.Default()
+
+	// Use the config middleware for all routes
+	router.Use(ConfigMiddleware(cfg))
 
 	router.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
