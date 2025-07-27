@@ -16,6 +16,8 @@ func SetupRouter() *gin.Engine {
 		})
 	})
 
+	router.POST("/test", handlers.TestCommunication)
+
 	// Key management endpoints
 	keyGroup := router.Group("/key")
 	{

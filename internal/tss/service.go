@@ -61,6 +61,7 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 	for finishedParties < partiesCount {
 		select {
 		case msg := <-outCh:
+			logger.Log.Infof("[TSS KeyGen] Received message: Type=%s, From=%s, To=%v, Broadcast=%v", msg.Type(), msg.GetFrom(), msg.GetTo(), msg.IsBroadcast())
 			bz, _, err := msg.WireBytes()
 			if err != nil {
 				return nil, fmt.Errorf("error getting wire bytes: %v", err)
@@ -69,12 +70,14 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 			if err != nil {
 				return nil, fmt.Errorf("error parsing message: %v", err)
 			}
+			logger.Log.Infof("[TSS KeyGen] Parsed message content: %+v", parsedMsg)
 			dest := msg.GetTo()
 			if dest == nil { // broadcast
 				for _, pID := range partyIDs {
 					if pID == msg.GetFrom() {
 						continue
 					}
+					logger.Log.Infof("[TSS KeyGen] Relaying broadcast message from %s to %s", msg.GetFrom(), pID)
 					go func(p tss.Party) {
 						if _, err := p.Update(parsedMsg); err != nil {
 							errCh <- err
@@ -86,6 +89,7 @@ func GenerateAndSaveKey() (*models.KeyData, error) {
 					if pID == msg.GetFrom() {
 						continue
 					}
+					logger.Log.Infof("[TSS KeyGen] Relaying p2p message from %s to %s", msg.GetFrom(), pID)
 					go func(p tss.Party) {
 						if _, err := p.Update(parsedMsg); err != nil {
 							errCh <- err
@@ -252,6 +256,7 @@ func SignMessage(keyID uuid.UUID, message string) (*common.SignatureData, error)
 	for finishedSigners < len(signingPartyIDs) {
 		select {
 		case msg := <-signOutCh:
+			logger.Log.Infof("[TSS Signing] Received message: Type=%s, From=%s, To=%v, Broadcast=%v", msg.Type(), msg.GetFrom(), msg.GetTo(), msg.IsBroadcast())
 			bz, _, err := msg.WireBytes()
 			if err != nil {
 				signErrCh <- tss.NewError(err, "SignAndVerify", 0, msg.GetFrom())
@@ -264,10 +269,12 @@ func SignMessage(keyID uuid.UUID, message string) (*common.SignatureData, error)
 			}
 			dest := msg.GetTo()
 			if dest == nil {
+				// broadcast
 				for _, pID := range signingPartyIDs {
 					if pID == msg.GetFrom() {
 						continue
 					}
+					logger.Log.Infof("[TSS Signing] Relaying broadcast message from %s to %s", msg.GetFrom(), pID)
 					go func(p tss.Party) {
 						if _, err := p.Update(pMsg); err != nil {
 							signErrCh <- err
@@ -275,10 +282,12 @@ func SignMessage(keyID uuid.UUID, message string) (*common.SignatureData, error)
 					}(signingParties[pID])
 				}
 			} else {
+				// point-to-point
 				for _, pID := range dest {
 					if pID == msg.GetFrom() {
 						continue
 					}
+					logger.Log.Infof("[TSS Signing] Relaying p2p message from %s to %s", msg.GetFrom(), pID)
 					go func(p tss.Party) {
 						if _, err := p.Update(pMsg); err != nil {
 							signErrCh <- err
