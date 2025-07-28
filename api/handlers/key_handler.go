@@ -34,7 +34,17 @@ type VerifyRequest struct {
 	Signature string `json:"signature" binding:"required"`
 }
 
+type GenerateKeyRequest struct {
+	SessionID string `json:"sessionId" binding:"required"`
+}
+
 func GenerateKey(c *gin.Context) {
+	var req GenerateKeyRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request, sessionId is required"})
+		return
+	}
+
 	// Retrieve the config from the context
 	cfg, exists := c.Get("config")
 	if !exists {
@@ -71,9 +81,9 @@ func GenerateKey(c *gin.Context) {
 		return
 	}
 
-	keyRecord, err := tss.GenerateAndSaveKey(appConfig, nodeNameStr)
+	keyRecord, err := tss.GenerateAndSaveKey(appConfig, nodeNameStr, req.SessionID)
 	if err != nil {
-		logger.Log.Errorf("Failed to generate key: %v", err)
+		logger.Log.Errorf("Failed to generate key for session %s: %v", req.SessionID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to generate key: " + err.Error(),
 		})

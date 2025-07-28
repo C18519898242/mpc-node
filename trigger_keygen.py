@@ -1,6 +1,8 @@
 import threading
 import requests
 import time
+import uuid
+import json
 
 # List of API endpoints for the nodes
 NODE_URLS = [
@@ -9,27 +11,39 @@ NODE_URLS = [
     "http://127.0.0.1:9003/key/generate",
 ]
 
-def call_generate_api(url):
+def call_generate_api(url, session_id):
     """
-    Sends a POST request to the specified URL and prints the response.
+    Sends a POST request with a session ID to the specified URL.
     """
+    headers = {'Content-Type': 'application/json'}
+    payload = {'sessionId': session_id}
+    
     try:
-        print(f"[{time.time()}] Sending request to {url}...")
-        response = requests.post(url, timeout=60) # Increased timeout for long-running TSS process
-        print(f"--- Response from {url} ---")
-        print(f"Status Code: {response.status_code}")
-        print(f"Body: {response.json()}")
-        print("-" * 30)
+        print(f"[{time.time()}] Sending request to {url} with session {session_id}...")
+        response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+
+        print(f"--- SUCCESS from {url} (Status: {response.status_code}) ---")
+        print(response.json())
+        print("-" * 40)
+
+    except requests.exceptions.HTTPError as e:
+        print(f"!!! HTTP Error from {url}: {e.response.status_code} {e.response.reason} !!!")
+        try:
+            print(f"    Error Body: {e.response.json()}")
+        except Exception:
+            pass
     except requests.exceptions.RequestException as e:
-        print(f"!!! Error calling {url}: {e} !!!")
+        print(f"!!! Request Error calling {url}: {e} !!!")
 
 if __name__ == "__main__":
     threads = []
-    print("Starting key generation ceremony by calling all nodes...")
+    session_id = str(uuid.uuid4())
+    print(f"Starting key generation ceremony with Session ID: {session_id}")
 
     # Create and start a thread for each API call
     for url in NODE_URLS:
-        thread = threading.Thread(target=call_generate_api, args=(url,))
+        thread = threading.Thread(target=call_generate_api, args=(url, session_id))
         threads.append(thread)
         thread.start()
 
