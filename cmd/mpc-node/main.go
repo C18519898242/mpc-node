@@ -171,6 +171,9 @@ func handleCoordinationMessage(wireMsg network.WireMessage, sm *session.Manager,
 
 		// This needs to run in a goroutine so it doesn't block the network handler
 		go func() {
+			// When the goroutine finishes, signal completion by closing the Done channel.
+			defer close(session.Done)
+
 			_, err := tss.GenerateAndSaveKey(cfg, nodeName, keyUUID)
 			if err != nil {
 				logger.Log.Errorf("TSS key generation failed for session %s: %v", coordMsg.SessionID, err)

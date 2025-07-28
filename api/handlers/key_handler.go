@@ -13,6 +13,7 @@ import (
 	"mpc-node/internal/storage/models"
 	"mpc-node/internal/tss"
 	"net/http"
+	"time"
 
 	tsslib "github.com/bnb-chain/tss-lib/v2/tss"
 	"github.com/gin-gonic/gin"
@@ -106,11 +107,33 @@ func GenerateKey(c *gin.Context) {
 		// The coordinator acknowledges itself immediately.
 		sm.RecordAcknowledgement(req.SessionID, nodeName)
 
-		c.JSON(http.StatusOK, gin.H{
-			"status":    "Coordination started",
-			"sessionId": req.SessionID,
-			"keyId":     keyID.String(),
-		})
+		// Wait for the key generation to complete or timeout
+		select {
+		case <-session.Done:
+			// The process is finished (successfully or not).
+			// We can now check the final status.
+			finalSession, _ := sm.GetSession(req.SessionID)
+			if finalSession.Status == "Finished" {
+				c.JSON(http.StatusOK, gin.H{
+					"status":    "Success",
+					"sessionId": finalSession.SessionID,
+					"keyId":     finalSession.KeyID,
+				})
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"status":    "Failed",
+					"sessionId": finalSession.SessionID,
+					"error":     "Key generation ceremony failed.",
+				})
+			}
+		case <-time.After(60 * time.Second): // 60-second timeout
+			c.JSON(http.StatusRequestTimeout, gin.H{
+				"status":    "Timeout",
+				"sessionId": req.SessionID,
+				"error":     "Key generation timed out.",
+			})
+		}
+
 	} else {
 		// I am a follower
 		logger.Log.Infof("Follower %s: Waiting for KeyID broadcast for session %s", nodeName, req.SessionID)

@@ -16,6 +16,7 @@ type SessionState struct {
 	Acknowledgements map[string]bool // Tracks which participants have acknowledged the keyID
 	Status           string          // e.g., "Pending", "Ready", "Finished", "Failed"
 	CreatedAt        time.Time
+	Done             chan struct{} // Channel to signal completion of the ceremony
 }
 
 // Manager handles the lifecycle of TSS sessions.
@@ -47,6 +48,7 @@ func (m *Manager) GetOrCreateSession(sessionID string, participants []string, co
 		Acknowledgements: make(map[string]bool),
 		Status:           "Pending",
 		CreatedAt:        time.Now(),
+		Done:             make(chan struct{}),
 	}
 
 	m.sessions[sessionID] = session
