@@ -11,12 +11,18 @@ NODE_URLS = [
     "http://127.0.0.1:9003/key/generate",
 ]
 
-def call_generate_api(url, session_id):
+# List of all participating node names
+PARTICIPANTS = ["node1", "node2", "node3"]
+
+def call_generate_api(url, session_id, participants):
     """
-    Sends a POST request with a session ID to the specified URL.
+    Sends a POST request with a session ID and participant list to the specified URL.
     """
     headers = {'Content-Type': 'application/json'}
-    payload = {'sessionId': session_id}
+    payload = {
+        'sessionId': session_id,
+        'participants': participants
+    }
     
     try:
         print(f"[{time.time()}] Sending request to {url} with session {session_id}...")
@@ -43,7 +49,7 @@ if __name__ == "__main__":
 
     # Create and start a thread for each API call
     for url in NODE_URLS:
-        thread = threading.Thread(target=call_generate_api, args=(url, session_id))
+        thread = threading.Thread(target=call_generate_api, args=(url, session_id, PARTICIPANTS))
         threads.append(thread)
         thread.start()
 

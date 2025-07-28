@@ -2,13 +2,19 @@ package handlers
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"math/big"
 	"mpc-node/internal/config"
 	"mpc-node/internal/logger"
+	"mpc-node/internal/network"
+	"mpc-node/internal/party"
+	"mpc-node/internal/session"
 	"mpc-node/internal/storage"
 	"mpc-node/internal/storage/models"
 	"mpc-node/internal/tss"
 	"net/http"
 
+	tsslib "github.com/bnb-chain/tss-lib/v2/tss"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -35,65 +41,87 @@ type VerifyRequest struct {
 }
 
 type GenerateKeyRequest struct {
-	SessionID string `json:"sessionId" binding:"required"`
+	SessionID    string   `json:"sessionId" binding:"required"`
+	Participants []string `json:"participants" binding:"required"`
 }
 
 func GenerateKey(c *gin.Context) {
 	var req GenerateKeyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request, sessionId is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
 		return
 	}
 
-	// Retrieve the config from the context
-	cfg, exists := c.Get("config")
-	if !exists {
-		logger.Log.Error("Config not found in context")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Server configuration error",
-		})
-		return
-	}
-	appConfig, ok := cfg.(*config.Config)
-	if !ok {
-		logger.Log.Error("Invalid config type in context")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Invalid server configuration",
-		})
-		return
+	// --- Retrieve services from context ---
+	nodeNameVal, _ := c.Get("nodeName")
+	nodeName, _ := nodeNameVal.(string)
+
+	smVal, _ := c.Get("sessionManager")
+	sm, _ := smVal.(*session.Manager)
+
+	transportVal, _ := c.Get("transport")
+	transport, _ := transportVal.(network.Transport)
+
+	// --- Coordination Logic ---
+	// Create PartyID objects for all participants
+	partyIDs := make([]*tsslib.PartyID, len(req.Participants))
+	for i, pName := range req.Participants {
+		// The key for PartyID must be a non-nil big.Int. We can use the index.
+		partyIDs[i] = tsslib.NewPartyID(pName, pName, new(big.Int).SetInt64(int64(i)))
 	}
 
-	// Retrieve the nodeName from the context
-	nodeName, exists := c.Get("nodeName")
-	if !exists {
-		logger.Log.Error("Node name not found in context")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Server configuration error: node name missing",
+	// Sort them to ensure deterministic coordinator election
+	sortedPartyIDs := tsslib.SortPartyIDs(partyIDs)
+	coordinatorID := party.ElectCoordinator(req.SessionID, sortedPartyIDs)
+
+	// Create or get the session
+	session := sm.GetOrCreateSession(req.SessionID, req.Participants, coordinatorID.Id)
+	logger.Log.Infof("Session %s: Current node is %s, Coordinator is %s", req.SessionID, nodeName, coordinatorID.Id)
+
+	// Check if the current node is the coordinator
+	if nodeName == coordinatorID.Id {
+		// I am the coordinator
+		keyID := uuid.New()
+		session.KeyID = keyID.String() // Set KeyID in the local session state
+
+		logger.Log.Infof("Coordinator %s: Generated KeyID %s for session %s. Broadcasting...", nodeName, keyID, req.SessionID)
+
+		// Prepare broadcast message
+		payload, _ := json.Marshal(network.KeyIDBroadcastPayload{KeyID: keyID.String()})
+		broadcastMsg := &network.CoordinationMessage{
+			Type:      network.KeyIDBroadcast,
+			SessionID: req.SessionID,
+			Payload:   payload,
+			From:      coordinatorID,
+			To:        nil, // Broadcast to all
+		}
+
+		// Broadcast the KeyID to all other parties
+		if err := transport.SendCoordinationMessage(broadcastMsg); err != nil {
+			logger.Log.Errorf("Coordinator failed to broadcast KeyID: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start coordination"})
+			return
+		}
+
+		// The coordinator acknowledges itself immediately.
+		sm.RecordAcknowledgement(req.SessionID, nodeName)
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":    "Coordination started",
+			"sessionId": req.SessionID,
+			"keyId":     keyID.String(),
 		})
-		return
-	}
-	nodeNameStr, ok := nodeName.(string)
-	if !ok {
-		logger.Log.Error("Invalid node name type in context")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Invalid server configuration: node name type",
+	} else {
+		// I am a follower
+		logger.Log.Infof("Follower %s: Waiting for KeyID broadcast for session %s", nodeName, req.SessionID)
+		c.JSON(http.StatusAccepted, gin.H{
+			"status":    "Waiting for coordinator",
+			"sessionId": req.SessionID,
 		})
-		return
 	}
 
-	keyRecord, err := tss.GenerateAndSaveKey(appConfig, nodeNameStr, req.SessionID)
-	if err != nil {
-		logger.Log.Errorf("Failed to generate key for session %s: %v", req.SessionID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to generate key: " + err.Error(),
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"keyId":     keyRecord.KeyID,
-		"publicKey": keyRecord.PublicKey,
-	})
+	// The actual TSS key generation will be triggered from the network handler
+	// when the coordinator receives all ACKs.
 }
 
 func ListKeys(c *gin.Context) {

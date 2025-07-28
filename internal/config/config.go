@@ -35,6 +35,8 @@ type Node struct {
 	Node    string  `json:"node"`
 	Parties []Party `json:"parties"`
 	Port    int     `json:"port"`
+	APIPort int     `json:"api_port"`
+	Server  string  `json:"server"`
 }
 
 // Config holds the application's configuration values.

@@ -32,8 +32,8 @@ const (
 
 // GenerateAndSaveKey performs the TSS key generation using real network communication
 // and saves the result to the database.
-func GenerateAndSaveKey(cfg *config.Config, nodeName string, sessionID string) (*models.KeyData, error) {
-	logger.Log.Infof("--- Phase 1: Setup for Real Network Key Generation for Session %s ---", sessionID)
+func GenerateAndSaveKey(cfg *config.Config, nodeName string, keyID uuid.UUID) (*models.KeyData, error) {
+	logger.Log.Infof("--- Phase 1: Setup for Real Network Key Generation for KeyID %s ---", keyID)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // Ensure all goroutines are signalled to stop when we exit
 
@@ -158,9 +158,13 @@ func GenerateAndSaveKey(cfg *config.Config, nodeName string, sessionID string) (
 		pIDs = append(pIDs, pID.Id)
 	}
 
-	keyUUID, err := uuid.Parse(sessionID)
-	if err != nil {
-		return nil, fmt.Errorf("invalid sessionID format, must be a UUID: %v", err)
+	// In a real application, a shared transaction ID would be used to unify the key record.
+	// Here, each node will create a separate key record, which is a known limitation of this simplified design.
+	keyRecord := models.KeyData{
+		KeyID:     keyID,
+		PublicKey: pubKeyHex,
+		PartyIDs:  strings.Join(pIDs, ","),
+		Threshold: threshold,
 	}
 
 	// 5. --- Save results to DB ---
@@ -169,20 +173,13 @@ func GenerateAndSaveKey(cfg *config.Config, nodeName string, sessionID string) (
 		return nil, fmt.Errorf("failed to begin transaction: %v", tx.Error)
 	}
 
-	// Use FirstOrCreate to handle concurrent requests with the same sessionID
-	keyRecord := models.KeyData{
-		KeyID:     keyUUID,
-		PublicKey: pubKeyHex, // This will be set by the first party and consistent across all
-		PartyIDs:  strings.Join(pIDs, ","),
-		Threshold: threshold,
-	}
-
-	// Atomically find or create the key record.
-	// If another party already created it, it will be found.
-	// The public key should be the same since it's a result of the same TSS ceremony.
-	if err := tx.Where(models.KeyData{KeyID: keyUUID}).FirstOrCreate(&keyRecord).Error; err != nil {
+	// Use FirstOrCreate to prevent race conditions where multiple nodes try to create the same key record.
+	// The first one creates it, subsequent ones will find it.
+	// This is a simplification; a more robust solution might involve the coordinator being the sole writer
+	// for the main key record.
+	if err := tx.Where(models.KeyData{KeyID: keyRecord.KeyID}).FirstOrCreate(&keyRecord).Error; err != nil {
 		tx.Rollback()
-		return nil, fmt.Errorf("failed to find or create key record for session %s: %v", sessionID, err)
+		return nil, fmt.Errorf("failed to find or create key record: %v", err)
 	}
 
 	shareBytes, err := json.Marshal(saveData)
