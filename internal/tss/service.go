@@ -10,7 +10,6 @@ import (
 	"math/big"
 	"mpc-node/internal/config"
 	"mpc-node/internal/logger"
-	"mpc-node/internal/network"
 	"mpc-node/internal/party"
 	"mpc-node/internal/storage"
 	"mpc-node/internal/storage/models"
@@ -30,9 +29,14 @@ const (
 	threshold    = 1
 )
 
+// Transport defines the interface for sending TSS messages.
+type Transport interface {
+	Send(msg tss.Message) error
+}
+
 // GenerateAndSaveKey performs the TSS key generation using real network communication
 // and saves the result to the database.
-func GenerateAndSaveKey(cfg *config.Config, nodeName string, keyID uuid.UUID) (*models.KeyData, error) {
+func GenerateAndSaveKey(cfg *config.Config, nodeName string, keyID uuid.UUID, transport Transport) (*models.KeyData, error) {
 	logger.Log.Infof("--- Phase 1: Setup for Real Network Key Generation for KeyID %s ---", keyID)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // Ensure all goroutines are signalled to stop when we exit
@@ -87,8 +91,6 @@ func GenerateAndSaveKey(cfg *config.Config, nodeName string, keyID uuid.UUID) (*
 	errCh := make(chan *tss.Error, bufSize)
 	endCh := make(chan *keygen.LocalPartySaveData, bufSize)
 
-	transport := network.NewTCPTransport(partyIDMap)
-
 	// 2. --- Create and Register the LOCAL Party ---
 	params := tss.NewParameters(tss.S256(), tss.NewPeerContext(sortedPartyIDs), currentPartyID, len(sortedPartyIDs), threshold)
 	outCh := make(chan tss.Message, bufSize)
@@ -103,7 +105,7 @@ func GenerateAndSaveKey(cfg *config.Config, nodeName string, keyID uuid.UUID) (*
 	p := keygen.NewLocalParty(params, outCh, endCh)
 
 	// Start a goroutine to handle message transport for the local party
-	go func(p tss.Party, pTransport network.Transport, pOutCh <-chan tss.Message, pInCh <-chan tss.ParsedMessage, pCtx context.Context) {
+	go func(p tss.Party, pTransport Transport, pOutCh <-chan tss.Message, pInCh <-chan tss.ParsedMessage, pCtx context.Context) {
 		defer logger.Log.Infof("Party %s transport goroutine finished.", p.PartyID())
 		for {
 			select {
@@ -212,7 +214,7 @@ func GenerateAndSaveKey(cfg *config.Config, nodeName string, keyID uuid.UUID) (*
 	return &finalRecord, nil
 }
 
-func SignMessage(cfg *config.Config, nodeName string, keyID uuid.UUID, message string) (*common.SignatureData, error) {
+func SignMessage(cfg *config.Config, nodeName string, keyID uuid.UUID, message string, transport Transport) (*common.SignatureData, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -276,7 +278,6 @@ func SignMessage(cfg *config.Config, nodeName string, keyID uuid.UUID, message s
 	bufSize := len(sortedSigningPartyIDs) * 10
 	errCh := make(chan *tss.Error, bufSize)
 	endCh := make(chan *common.SignatureData, bufSize)
-	transport := network.NewTCPTransport(partyIDMap)
 
 	hash := sha256.Sum256([]byte(message))
 	msgToSign := new(big.Int).SetBytes(hash[:])
@@ -309,7 +310,7 @@ func SignMessage(cfg *config.Config, nodeName string, keyID uuid.UUID, message s
 
 	localParty := signing.NewLocalParty(msgToSign, params, *localSaveData, outCh, endCh)
 
-	go func(p tss.Party, pTransport network.Transport, pOutCh <-chan tss.Message, pInCh <-chan tss.ParsedMessage, pCtx context.Context) {
+	go func(p tss.Party, pTransport Transport, pOutCh <-chan tss.Message, pInCh <-chan tss.ParsedMessage, pCtx context.Context) {
 		defer logger.Log.Infof("Party %s transport goroutine finished.", p.PartyID())
 		for {
 			select {

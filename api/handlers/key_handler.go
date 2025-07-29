@@ -232,6 +232,24 @@ func SignMessage(c *gin.Context) {
 		return
 	}
 
+	// Retrieve the transport from the context
+	transportVal, exists := c.Get("transport")
+	if !exists {
+		logger.Log.Error("Transport not found in context")
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Server configuration error: transport missing",
+		})
+		return
+	}
+	transport, ok := transportVal.(network.Transport)
+	if !ok {
+		logger.Log.Error("Invalid transport type in context")
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Invalid server configuration: transport type",
+		})
+		return
+	}
+
 	keyUUID, err := uuid.Parse(req.KeyID)
 	if err != nil {
 		logger.Log.Errorf("Invalid KeyID format: %s", req.KeyID)
@@ -239,7 +257,7 @@ func SignMessage(c *gin.Context) {
 		return
 	}
 
-	signature, err := tss.SignMessage(appConfig, nodeNameStr, keyUUID, req.Message)
+	signature, err := tss.SignMessage(appConfig, nodeNameStr, keyUUID, req.Message, transport)
 	if err != nil {
 		logger.Log.Errorf("Failed to sign message for key %s: %v", req.KeyID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to sign message: " + err.Error()})
