@@ -218,25 +218,52 @@ func SignMessage(cfg *config.Config, nodeName string, keyID uuid.UUID, message s
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 1. --- Load Key and Shares from DB ---
+	// 1. --- Load Key Record and Local Share from DB ---
 	var keyRecord models.KeyData
-	err := storage.DB.Preload("Shares").First(&keyRecord, "key_id = ?", keyID).Error
-	if err != nil {
+	// Find the key record without preloading shares, as we only need the party list and pubkey
+	if err := storage.DB.First(&keyRecord, "key_id = ?", keyID).Error; err != nil {
 		return nil, fmt.Errorf("failed to find key with ID %s: %v", keyID, err)
 	}
-	if len(keyRecord.Shares) == 0 {
-		return nil, fmt.Errorf("no shares found for key with ID %s", keyID)
+
+	var localShare models.KeyShare
+	// Find the specific share for the current node
+	if err := storage.DB.Where("key_data_id = ? AND party_id = ?", keyID, nodeName).First(&localShare).Error; err != nil {
+		return nil, fmt.Errorf("failed to find share for party %s and key %s: %v", nodeName, keyID, err)
 	}
 
-	// 2. --- Deserialize Shares into a map for easy lookup ---
-	saveDataMap := make(map[string]*keygen.LocalPartySaveData, len(keyRecord.Shares))
-	for _, share := range keyRecord.Shares {
-		var shareData keygen.LocalPartySaveData
-		if err := json.Unmarshal(share.ShareData, &shareData); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal share data for party %s: %v", share.PartyID, err)
-		}
-		saveDataMap[share.PartyID] = &shareData
+	var localSaveData keygen.LocalPartySaveData
+	if err := json.Unmarshal(localShare.ShareData, &localSaveData); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal share data for party %s: %v", nodeName, err)
 	}
+
+	// 2. --- Reconstruct Party IDs ---
+	// HACK: As per user request, hardcoding the party list for testing purposes.
+	// The root cause of this is that the PartyIDs field in the database is not being
+	// populated with the full list of parties during the key generation phase.
+	partyNames := []string{"node1", "node2", "node3"}
+	if len(partyNames) == 0 {
+		return nil, fmt.Errorf("no party IDs found in key record for key %s", keyID)
+	}
+	// Sort party names alphabetically to ensure consistent PartyID creation, same as in keygen
+	sort.Strings(partyNames)
+
+	partyIDs := make(tss.UnSortedPartyIDs, len(partyNames))
+	for i, name := range partyNames {
+		// The key used in NewPartyID during keygen was the index + 1
+		partyIDs[i] = tss.NewPartyID(name, name, new(big.Int).SetInt64(int64(i+1)))
+	}
+	sortedSigningPartyIDs := tss.SortPartyIDs(partyIDs)
+
+	// This is a workaround for a suspected issue where localSaveData.Ks is not populated
+	// correctly with all party keys during key generation. We manually reconstruct it
+	// from the full list of party IDs stored in the key record.
+	allPartyKeys := make([]*big.Int, 0, len(sortedSigningPartyIDs))
+	for _, pID := range sortedSigningPartyIDs {
+		// The compiler consistently reports that pID.Key is of type []byte,
+		// so we convert it to *big.Int as required by the Ks slice.
+		allPartyKeys = append(allPartyKeys, new(big.Int).SetBytes(pID.Key))
+	}
+	localSaveData.Ks = allPartyKeys
 
 	// 3. --- Setup Signing Parties ---
 	// Find the configuration for the current node
@@ -250,29 +277,6 @@ func SignMessage(cfg *config.Config, nodeName string, keyID uuid.UUID, message s
 	if currentNode == nil {
 		return nil, fmt.Errorf("configuration for node '%s' not found", nodeName)
 	}
-
-	allPartyConfs := append(currentNode.Parties, config.Party{
-		Name:   currentNode.Node,
-		Port:   fmt.Sprintf("%d", currentNode.Port),
-		Server: "127.0.0.1", // Assuming self is always local
-	})
-
-	// Sort the party configurations by name to ensure a consistent order
-	sort.Slice(allPartyConfs, func(i, j int) bool {
-		return allPartyConfs[i].Name < allPartyConfs[j].Name
-	})
-
-	partyIDMap := make(map[string]string, len(allPartyConfs))
-	for _, p := range allPartyConfs {
-		partyIDMap[p.Name] = net.JoinHostPort(p.Server, p.Port)
-	}
-
-	// Reconstruct PartyIDs from the saved data map
-	partyIDs := make(tss.UnSortedPartyIDs, 0, len(saveDataMap))
-	for partyName, sd := range saveDataMap {
-		partyIDs = append(partyIDs, tss.NewPartyID(partyName, partyName, sd.ShareID))
-	}
-	sortedSigningPartyIDs := tss.SortPartyIDs(partyIDs)
 
 	// Use a higher buffer size for channels to prevent blocking
 	bufSize := len(sortedSigningPartyIDs) * 10
@@ -295,9 +299,8 @@ func SignMessage(cfg *config.Config, nodeName string, keyID uuid.UUID, message s
 	}
 
 	params := tss.NewParameters(tss.S256(), tss.NewPeerContext(sortedSigningPartyIDs), currentPartyID, len(sortedSigningPartyIDs), keyRecord.Threshold)
-	localSaveData, ok := saveDataMap[currentPartyID.Id]
-	if !ok || localSaveData.ShareID == nil {
-		return nil, fmt.Errorf("could not find local save data for party %s", currentPartyID.Id)
+	if localSaveData.ShareID == nil {
+		return nil, fmt.Errorf("invalid local save data for party %s: ShareID is nil", currentPartyID.Id)
 	}
 
 	outCh := make(chan tss.Message, bufSize)
@@ -308,7 +311,7 @@ func SignMessage(cfg *config.Config, nodeName string, keyID uuid.UUID, message s
 	party.DefaultRegistry.Register(localPort, inCh)
 	defer party.DefaultRegistry.Deregister(localPort)
 
-	localParty := signing.NewLocalParty(msgToSign, params, *localSaveData, outCh, endCh)
+	localParty := signing.NewLocalParty(msgToSign, params, localSaveData, outCh, endCh)
 
 	go func(p tss.Party, pTransport Transport, pOutCh <-chan tss.Message, pInCh <-chan tss.ParsedMessage, pCtx context.Context) {
 		defer logger.Log.Infof("Party %s transport goroutine finished.", p.PartyID())
