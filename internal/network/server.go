@@ -2,8 +2,8 @@ package network
 
 import (
 	"encoding/json"
-	"math/big"
 	"mpc-node/internal/config"
+	"mpc-node/internal/dto"
 	"mpc-node/internal/logger"
 	"mpc-node/internal/party"
 	"mpc-node/internal/session"
@@ -13,6 +13,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/bnb-chain/tss-lib/v2/common"
 	tsslib "github.com/bnb-chain/tss-lib/v2/tss"
 	"github.com/google/uuid"
 )
@@ -155,12 +156,10 @@ func (s *Server) handleCoordinationMessage(wireMsg WireMessage) {
 		}
 
 		// Find current party ID
-		var currentPartyID *tsslib.PartyID
-		for i, p := range s.cfg.Nodes {
-			if p.Node == s.nodeName {
-				currentPartyID = tsslib.NewPartyID(p.Node, p.Node, new(big.Int).SetInt64(int64(i)))
-				break
-			}
+		currentPartyID, _, err := tss.CreatePartyIDs(payload.Participants, s.nodeName)
+		if err != nil {
+			logger.Log.Errorf("Failed to create party ID for ACK: %v", err)
+			return
 		}
 
 		ackMsg := &CoordinationMessage{
@@ -186,14 +185,12 @@ func (s *Server) handleCoordinationMessage(wireMsg WireMessage) {
 			}
 
 			// Find coordinator's party ID to set as the 'From' field
-			var coordinatorPartyID *tsslib.PartyID
-			for i, p := range s.cfg.Nodes {
-				if p.Node == session.Coordinator {
-					coordinatorPartyID = tsslib.NewPartyID(p.Node, p.Node, new(big.Int).SetInt64(int64(i)))
-					break
-				}
+			coordinatorPartyID, _, err := tss.CreatePartyIDs(session.Participants, session.Coordinator)
+			if err != nil {
+				logger.Log.Errorf("Could not create party ID for coordinator %s: %v", session.Coordinator, err)
+				return
 			}
-			if coordinatorPartyID == nil {
+			if coordinatorPartyID == nil { // Should be redundant due to error check, but good practice
 				logger.Log.Errorf("Could not find party ID for coordinator %s", session.Coordinator)
 				return
 			}
@@ -225,6 +222,33 @@ func (s *Server) handleCoordinationMessage(wireMsg WireMessage) {
 
 		// This needs to run in a goroutine so it doesn't block the network handler
 		go s.runKeyGeneration(session, coordMsg.SessionID, keyUUID)
+
+	case RequestSignature:
+		var payload RequestSignaturePayload
+		if err := json.Unmarshal(coordMsg.Payload, &payload); err != nil {
+			logger.Log.Errorf("Failed to unmarshal RequestSignature payload: %v", err)
+			return
+		}
+		session, ok := s.sessionManager.GetSession(coordMsg.SessionID)
+		if !ok {
+			logger.Log.Warnf("Received signature request for unknown session %s", coordMsg.SessionID)
+			return
+		}
+		session.MessageToSign = payload.Message
+		session.KeyID = payload.KeyID
+
+		go s.runSigningCeremony(session)
+
+	case SignatureShare:
+		// This message is received by the coordinator from all parties (including itself)
+		var payload common.SignatureData
+		if err := json.Unmarshal(coordMsg.Payload, &payload); err != nil {
+			logger.Log.Errorf("Failed to unmarshal SignatureShare payload: %v", err)
+			return
+		}
+
+		logger.Log.Infof("Coordinator received signature share from %s for session %s", coordMsg.From.Id, coordMsg.SessionID)
+		s.handleSignatureShare(&coordMsg, &payload)
 
 	case KeygenPublicDataShare:
 		// This message is received by the coordinator from all parties (including itself)
@@ -282,7 +306,7 @@ func (s *Server) handlePublicDataShare(coordMsg *CoordinationMessage, payload *K
 	}
 
 	// Store the received public data share
-	session.PublicDataShares[coordMsg.From.Id] = payload.PublicData
+	session.PublicDataShares[coordMsg.From.Id] = payload.SaveData
 
 	logger.Log.Infof("Coordinator has %d/%d public data shares for session %s.", len(session.PublicDataShares), len(session.Participants), coordMsg.SessionID)
 
@@ -298,6 +322,11 @@ func (s *Server) handlePublicDataShare(coordMsg *CoordinationMessage, payload *K
 	// The private key share (Xi) is not included, as the coordinator doesn't have it.
 	// This combined object is what's needed for signing.
 	combinedSaveData := tss.CombinePublicData(session.PublicDataShares)
+	if combinedSaveData == nil {
+		logger.Log.Errorf("Failed to combine public data for session %s", coordMsg.SessionID)
+		s.sessionManager.UpdateStatus(coordMsg.SessionID, "Failed")
+		return
+	}
 
 	// Marshal the combined data
 	fullSaveDataBytes, err := json.Marshal(combinedSaveData)
@@ -335,13 +364,10 @@ func (s *Server) handlePublicDataShare(coordMsg *CoordinationMessage, payload *K
 	}
 
 	// Find coordinator's party ID to set as the 'From' field
-	var coordinatorPartyID *tsslib.PartyID
-	for i, p := range s.cfg.Nodes {
-		if p.Node == session.Coordinator {
-			// This is a simplification. A robust solution would use sorted party IDs.
-			coordinatorPartyID = tsslib.NewPartyID(p.Node, p.Node, new(big.Int).SetInt64(int64(i+1)))
-			break
-		}
+	coordinatorPartyID, _, err := tss.CreatePartyIDs(session.Participants, session.Coordinator)
+	if err != nil {
+		logger.Log.Errorf("Coordinator failed to create its own party ID for result broadcast: %v", err)
+		return
 	}
 
 	resultMsg := &CoordinationMessage{
@@ -370,7 +396,7 @@ func (s *Server) runKeyGeneration(session *session.SessionState, sessionID strin
 	// This is now handled in `handlePublicDataShare` after the final result is broadcast.
 	isCoordinator := s.nodeName == session.Coordinator
 
-	publicData, localSaveData, err := tss.GenerateAndSaveKey(s.cfg, s.nodeName, s.transport)
+	localSaveData, err := tss.GenerateAndSaveKey(s.cfg, s.nodeName, session.Participants, s.transport)
 	if err != nil {
 		logger.Log.Errorf("TSS key generation failed for session %s: %v", sessionID, err)
 		if isCoordinator {
@@ -403,7 +429,7 @@ func (s *Server) runKeyGeneration(session *session.SessionState, sessionID strin
 	logger.Log.Infof("Successfully saved local key share for key %s", keyUUID)
 
 	// --- 2. Send the public data to the coordinator ---
-	payloadBytes, err := json.Marshal(KeygenPublicDataPayload{PublicData: publicData})
+	payloadBytes, err := json.Marshal(KeygenPublicDataPayload{SaveData: localSaveData})
 	if err != nil {
 		logger.Log.Errorf("Failed to marshal public data payload: %v", err)
 		if isCoordinator {
@@ -413,18 +439,23 @@ func (s *Server) runKeyGeneration(session *session.SessionState, sessionID strin
 	}
 
 	// Find current party ID and coordinator party ID
-	var currentPartyID, coordinatorPartyID *tsslib.PartyID
-	for i, p := range s.cfg.Nodes {
-		// This is a simplification. A robust solution would use sorted party IDs.
-		pID := tsslib.NewPartyID(p.Node, p.Node, new(big.Int).SetInt64(int64(i+1)))
-		if p.Node == s.nodeName {
-			currentPartyID = pID
+	currentPartyID, _, err := tss.CreatePartyIDs(session.Participants, s.nodeName)
+	if err != nil {
+		logger.Log.Errorf("Could not determine party IDs for keygen public data share: %v", err)
+		if isCoordinator {
+			s.sessionManager.UpdateStatus(sessionID, "Failed")
 		}
-		if p.Node == session.Coordinator {
-			coordinatorPartyID = pID
-		}
+		return
 	}
-	if currentPartyID == nil || coordinatorPartyID == nil {
+	coordinatorPartyID, _, err := tss.CreatePartyIDs(session.Participants, session.Coordinator)
+	if err != nil {
+		logger.Log.Errorf("Could not determine coordinator party ID for keygen public data share: %v", err)
+		if isCoordinator {
+			s.sessionManager.UpdateStatus(sessionID, "Failed")
+		}
+		return
+	}
+	if currentPartyID == nil || coordinatorPartyID == nil { // Should be redundant
 		logger.Log.Error("Could not determine party IDs for keygen public data share")
 		if isCoordinator {
 			s.sessionManager.UpdateStatus(sessionID, "Failed")
@@ -453,4 +484,99 @@ func (s *Server) runKeyGeneration(session *session.SessionState, sessionID strin
 	// If this is a follower node, its job is done.
 	// If this is the coordinator, it will now wait for messages from all other nodes.
 	// The final status update will happen in the KeygenPublicDataShare handler.
+}
+
+func (s *Server) runSigningCeremony(session *session.SessionState) {
+	logger.Log.Infof("Node %s: Starting signing ceremony for session %s", s.nodeName, session.SessionID)
+
+	keyUUID, err := uuid.Parse(session.KeyID)
+	if err != nil {
+		logger.Log.Errorf("Invalid KeyID in signing session %s: %v", session.SessionID, err)
+		return
+	}
+
+	// The tss.SignMessage function now encapsulates the logic for a single party to participate.
+	// We need to rename/refactor it to reflect this. Let's call it `ParticipateInSigning`.
+	signature, err := tss.SignMessage(s.cfg, s.nodeName, keyUUID, session.MessageToSign, s.transport)
+	if err != nil {
+		logger.Log.Errorf("TSS signing failed for session %s: %v", session.SessionID, err)
+		// Inform the coordinator about the failure? For now, we just log.
+		return
+	}
+
+	// --- Send the signature share to the coordinator ---
+	payloadBytes, err := json.Marshal(signature)
+	if err != nil {
+		logger.Log.Errorf("Failed to marshal signature share payload: %v", err)
+		return
+	}
+
+	// Find current party ID and coordinator party ID
+	currentPartyID, _, err := tss.CreatePartyIDs(session.Participants, s.nodeName)
+	if err != nil {
+		logger.Log.Errorf("Could not determine party IDs for signature share: %v", err)
+		return
+	}
+	coordinatorPartyID, _, err := tss.CreatePartyIDs(session.Participants, session.Coordinator)
+	if err != nil {
+		logger.Log.Errorf("Could not determine coordinator party ID for signature share: %v", err)
+		return
+	}
+
+	if currentPartyID == nil || coordinatorPartyID == nil { // Should be redundant
+		logger.Log.Error("Could not determine party IDs for signature share")
+		return
+	}
+
+	msg := &CoordinationMessage{
+		Type:      SignatureShare,
+		SessionID: session.SessionID,
+		Payload:   payloadBytes,
+		From:      currentPartyID,
+		To:        []*tsslib.PartyID{coordinatorPartyID},
+	}
+
+	if err := s.transport.SendCoordinationMessage(msg); err != nil {
+		logger.Log.Errorf("Failed to send signature share to coordinator: %v", err)
+		return
+	}
+
+	logger.Log.Infof("Node %s sent signature share to coordinator %s for session %s", s.nodeName, session.Coordinator, session.SessionID)
+}
+
+func (s *Server) handleSignatureShare(coordMsg *CoordinationMessage, payload *common.SignatureData) {
+	session, ok := s.sessionManager.GetSession(coordMsg.SessionID)
+	if !ok {
+		logger.Log.Errorf("Session %s not found for signature share", coordMsg.SessionID)
+		return
+	}
+
+	// This function should only be executed by the coordinator
+	if s.nodeName != session.Coordinator {
+		return
+	}
+
+	// Store the received signature share
+	session.SignatureShares[coordMsg.From.Id] = payload
+
+	logger.Log.Infof("Coordinator has %d/%d signature shares for session %s.", len(session.SignatureShares), len(session.Participants), coordMsg.SessionID)
+
+	// In ECDSA, the first party to output a signature has the full, final signature.
+	// There's no need to wait for all shares. The first one is sufficient.
+	if len(session.SignatureShares) >= 1 {
+		logger.Log.Infof("First signature share received for session %s. Sending result to API handler.", coordMsg.SessionID)
+
+		// The payload is the complete signature
+		finalSignature := payload
+
+		// Send the result back to the waiting API handler
+		session.SignatureResult <- &dto.SignatureResponsePayload{
+			Signature: finalSignature,
+		}
+		close(session.SignatureResult) // Close channel to signal completion
+
+		// Optionally, broadcast the final signature to other participants if they need it.
+		// For now, we'll skip this step.
+		s.sessionManager.UpdateStatus(coordMsg.SessionID, "Finished")
+	}
 }

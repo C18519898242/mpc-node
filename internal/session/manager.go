@@ -5,20 +5,29 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bnb-chain/tss-lib/v2/common"
+	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
 	"github.com/google/uuid"
 )
 
-// SessionState represents the state of a key generation session.
+// SessionState represents the state of a key generation or signing session.
 type SessionState struct {
-	SessionID        string
-	KeyID            string
-	Participants     []string
-	Coordinator      string
-	Acknowledgements map[string]bool // Tracks which participants have acknowledged the keyID
-	PublicDataShares map[string]*dto.PublicPartySaveData
-	Status           string // e.g., "Pending", "Ready", "Finished", "Failed"
-	CreatedAt        time.Time
-	Done             chan struct{} // Channel to signal completion of the ceremony
+	SessionID    string
+	KeyID        string
+	Participants []string
+	Coordinator  string
+	Status       string // e.g., "Pending", "Ready", "Finished", "Failed"
+	CreatedAt    time.Time
+
+	// Keygen-specific fields
+	Acknowledgements map[string]bool
+	PublicDataShares map[string]*keygen.LocalPartySaveData
+	Done             chan struct{} // Channel to signal completion of the keygen ceremony
+
+	// Signing-specific fields
+	MessageToSign   string
+	SignatureShares map[string]*common.SignatureData
+	SignatureResult chan *dto.SignatureResponsePayload // Channel to send the final signature back to the API handler
 }
 
 // Manager handles the lifecycle of TSS sessions.
@@ -47,11 +56,13 @@ func (m *Manager) GetOrCreateSession(sessionID string, participants []string, co
 		SessionID:        sessionID,
 		Participants:     participants,
 		Coordinator:      coordinator,
-		Acknowledgements: make(map[string]bool),
-		PublicDataShares: make(map[string]*dto.PublicPartySaveData),
 		Status:           "Pending",
 		CreatedAt:        time.Now(),
+		Acknowledgements: make(map[string]bool),
+		PublicDataShares: make(map[string]*keygen.LocalPartySaveData),
 		Done:             make(chan struct{}),
+		SignatureShares:  make(map[string]*common.SignatureData),
+		SignatureResult:  make(chan *dto.SignatureResponsePayload, 1), // Buffered channel
 	}
 
 	m.sessions[sessionID] = session

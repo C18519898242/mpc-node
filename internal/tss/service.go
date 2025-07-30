@@ -9,17 +9,14 @@ import (
 	"fmt"
 	"math/big"
 	"mpc-node/internal/config"
-	"mpc-node/internal/dto"
 	"mpc-node/internal/logger"
 	"mpc-node/internal/party"
 	"mpc-node/internal/storage"
 	"mpc-node/internal/storage/models"
-	"net"
 	"sort"
 	"strings"
 
 	"github.com/bnb-chain/tss-lib/v2/common"
-	"github.com/bnb-chain/tss-lib/v2/crypto/paillier"
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
 	"github.com/bnb-chain/tss-lib/v2/ecdsa/signing"
 	"github.com/bnb-chain/tss-lib/v2/tss"
@@ -37,10 +34,36 @@ type Transport interface {
 	Send(msg tsslib.Message) error
 }
 
+// CreatePartyIDs creates a sorted list of PartyIDs from a list of participant names.
+// It ensures that PartyIDs are created consistently across the application.
+func CreatePartyIDs(participants []string, currentNodeName string) (*tss.PartyID, tss.SortedPartyIDs, error) {
+	// Sort party names alphabetically to ensure consistent PartyID creation
+	sort.Strings(participants)
+
+	partyIDs := make(tss.UnSortedPartyIDs, len(participants))
+	var currentPartyID *tss.PartyID
+
+	for i, name := range participants {
+		// The key used in NewPartyID must be a unique, consistent identifier for each party.
+		// Using the index from the sorted list ensures this.
+		pID := tss.NewPartyID(name, name, new(big.Int).SetInt64(int64(i+1)))
+		partyIDs[i] = pID
+		if name == currentNodeName {
+			currentPartyID = pID
+		}
+	}
+
+	if currentPartyID == nil && currentNodeName != "" {
+		return nil, nil, fmt.Errorf("could not find party ID for current node '%s' in participant list", currentNodeName)
+	}
+
+	sortedPartyIDs := tss.SortPartyIDs(partyIDs)
+	return currentPartyID, sortedPartyIDs, nil
+}
+
 // GenerateAndSaveKey performs the TSS key generation using real network communication.
-// It returns the public part of the save data (to be sent to the coordinator) and
-// the full local save data (to be stored locally).
-func GenerateAndSaveKey(cfg *config.Config, nodeName string, transport Transport) (*dto.PublicPartySaveData, *keygen.LocalPartySaveData, error) {
+// It returns the full local save data (to be stored locally and sent to the coordinator).
+func GenerateAndSaveKey(cfg *config.Config, nodeName string, participants []string, transport Transport) (*keygen.LocalPartySaveData, error) {
 	logger.Log.Infof("--- Phase 1: Setup for Real Network Key Generation ---")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // Ensure all goroutines are signalled to stop when we exit
@@ -54,40 +77,13 @@ func GenerateAndSaveKey(cfg *config.Config, nodeName string, transport Transport
 		}
 	}
 	if currentNode == nil {
-		return nil, nil, fmt.Errorf("configuration for node '%s' not found", nodeName)
+		return nil, fmt.Errorf("configuration for node '%s' not found", nodeName)
 	}
 
 	// 1. --- Party and Network Setup ---
-	allPartyConfs := append(currentNode.Parties, config.Party{
-		Name:   currentNode.Node,
-		Port:   fmt.Sprintf("%d", currentNode.Port),
-		Server: "127.0.0.1", // Assuming self is always local for now
-	})
-
-	// Sort the party configurations by name to ensure a consistent order for PartyID creation
-	sort.Slice(allPartyConfs, func(i, j int) bool {
-		return allPartyConfs[i].Name < allPartyConfs[j].Name
-	})
-
-	partyIDs := make(tss.UnSortedPartyIDs, len(allPartyConfs))
-	partyIDMap := make(map[string]string, len(allPartyConfs))
-	for i, p := range allPartyConfs {
-		pID := tss.NewPartyID(p.Name, p.Name, new(big.Int).SetInt64(int64(i+1)))
-		partyIDs[i] = pID
-		partyIDMap[pID.Id] = net.JoinHostPort(p.Server, p.Port)
-	}
-	sortedPartyIDs := tss.SortPartyIDs(partyIDs)
-
-	// Find the PartyID for the current node
-	var currentPartyID *tss.PartyID
-	for _, pID := range sortedPartyIDs {
-		if pID.Id == currentNode.Node {
-			currentPartyID = pID
-			break
-		}
-	}
-	if currentPartyID == nil {
-		return nil, nil, fmt.Errorf("could not find party ID for current node '%s'", nodeName)
+	currentPartyID, sortedPartyIDs, err := CreatePartyIDs(participants, nodeName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create party IDs: %v", err)
 	}
 
 	// Use a higher buffer size for channels to prevent blocking
@@ -151,57 +147,61 @@ func GenerateAndSaveKey(cfg *config.Config, nodeName string, transport Transport
 		saveData = save
 	case err := <-errCh:
 		logger.Log.Errorf("Error during keygen for party %s: %v", p.PartyID(), err)
-		return nil, nil, err
+		return nil, err
 	}
 
 	logger.Log.Info("Key generation successful for this party!")
 
-	publicData := &dto.PublicPartySaveData{
-		Ks:          saveData.Ks,
-		NTildej:     saveData.NTildej,
-		H1j:         saveData.H1j,
-		H2j:         saveData.H2j,
-		ECDSAPub:    saveData.ECDSAPub,
-		PaillierPKs: saveData.PaillierPKs,
-		ShareID:     saveData.ShareID,
-	}
-
-	return publicData, saveData, nil
+	return saveData, nil
 }
 
-// CombinePublicData takes the public shares from all parties and combines them into a single
-// LocalPartySaveData object that contains all public information for the key.
-func CombinePublicData(shares map[string]*dto.PublicPartySaveData) *keygen.LocalPartySaveData {
-	combined := &keygen.LocalPartySaveData{
-		Ks:          make([]*big.Int, 0),
-		NTildej:     make([]*big.Int, 0),
-		H1j:         make([]*big.Int, 0),
-		H2j:         make([]*big.Int, 0),
-		PaillierPKs: make([]*paillier.PublicKey, 0),
+// CombinePublicData creates a new LocalPartySaveData object containing only the
+// public key material from a single party's save data. It does this by creating a
+// deep copy and then setting the private key fields to nil. This is the data
+// that will be stored in the `full_save_data` column for the key.
+func CombinePublicData(shares map[string]*keygen.LocalPartySaveData) *keygen.LocalPartySaveData {
+	if len(shares) == 0 {
+		return nil
 	}
 
-	// We need a consistent order to combine the shares
-	partyIDs := make([]string, 0, len(shares))
-	for id := range shares {
-		partyIDs = append(partyIDs, id)
-	}
-	sort.Strings(partyIDs)
-
-	isFirst := true
-	for _, partyID := range partyIDs {
-		data := shares[partyID]
-		if isFirst {
-			combined.ECDSAPub = data.ECDSAPub
-			isFirst = false
-		}
-		combined.Ks = append(combined.Ks, data.Ks...)
-		combined.NTildej = append(combined.NTildej, data.NTildej...)
-		combined.H1j = append(combined.H1j, data.H1j...)
-		combined.H2j = append(combined.H2j, data.H2j...)
-		combined.PaillierPKs = append(combined.PaillierPKs, data.PaillierPKs...)
+	// Get the first share from the map. It doesn't matter which one, as the public
+	// data required for signing is the same across all of them.
+	var firstShare *keygen.LocalPartySaveData
+	for _, s := range shares {
+		firstShare = s
+		break
 	}
 
-	return combined
+	// Create a deep copy to avoid modifying the original object in the session.
+	// A simple struct copy `*firstShare` is not enough due to nested pointers.
+	// Marshalling and unmarshalling is a reliable way to deep copy.
+	tempBytes, err := json.Marshal(firstShare)
+	if err != nil {
+		logger.Log.Errorf("Failed to marshal for deep copy: %v", err)
+		return nil
+	}
+	var publicData keygen.LocalPartySaveData
+	if err := json.Unmarshal(tempBytes, &publicData); err != nil {
+		logger.Log.Errorf("Failed to unmarshal for deep copy: %v", err)
+		return nil
+	}
+
+	// Nil out all private key fields. These are not needed for the combined
+	// public key data that is stored in the database. The local party's private
+	// share (`Xi`) will be injected back in at signing time.
+	publicData.Xi = nil
+	publicData.ShareID = nil
+	// These are also private and should not be in the combined data
+	publicData.PaillierSK = nil
+	publicData.NTildei = nil
+	publicData.H1i = nil
+	publicData.H2i = nil
+	publicData.Alpha = nil
+	publicData.Beta = nil
+	publicData.P = nil
+	publicData.Q = nil
+
+	return &publicData
 }
 
 func SignMessage(cfg *config.Config, nodeName string, keyID uuid.UUID, message string, transport Transport) (*common.SignatureData, error) {
@@ -232,30 +232,34 @@ func SignMessage(cfg *config.Config, nodeName string, keyID uuid.UUID, message s
 		return nil, fmt.Errorf("failed to unmarshal local private share for party %s: %v", nodeName, err)
 	}
 
-	// Inject the local private key into the combined public data object
-	// This creates the complete SaveData object needed for signing
-	combinedSaveData.Xi = localPrivateShare.Xi
-	combinedSaveData.ShareID = localPrivateShare.ShareID
-
+	// Inject the local private key and other private data into the combined public data object.
+	// This creates the complete SaveData object needed for this party to sign.
 	localSaveData := combinedSaveData
+	localSaveData.Xi = localPrivateShare.Xi
+	localSaveData.ShareID = localPrivateShare.ShareID
+	localSaveData.PaillierSK = localPrivateShare.PaillierSK
+	// Also inject the party-specific public values, in case the one we used for the
+	// combined data was from a different party.
+	localSaveData.NTildei = localPrivateShare.NTildei
+	localSaveData.H1i = localPrivateShare.H1i
+	localSaveData.H2i = localPrivateShare.H2i
 
 	// 2. --- Reconstruct Party IDs ---
 	partyNames := strings.Split(keyRecord.PartyIDs, ",")
-	if len(partyNames) == 0 {
-		return nil, fmt.Errorf("no party IDs found in key record for key %s", keyID)
+	currentPartyID, sortedSigningPartyIDs, err := CreatePartyIDs(partyNames, nodeName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create party IDs for signing: %v", err)
 	}
-	// Sort party names alphabetically to ensure consistent PartyID creation, same as in keygen
-	sort.Strings(partyNames)
-
-	partyIDs := make(tss.UnSortedPartyIDs, len(partyNames))
-	for i, name := range partyNames {
-		// The key used in NewPartyID during keygen was the index + 1
-		partyIDs[i] = tss.NewPartyID(name, name, new(big.Int).SetInt64(int64(i+1)))
-	}
-	sortedSigningPartyIDs := tss.SortPartyIDs(partyIDs)
 
 	// The combinedSaveData loaded from FullSaveData now contains the correct, full set of Ks.
 	// The old workaround is no longer needed.
+	// IMPORTANT: We must reconstruct the Ks slice to match the sorted order of the parties
+	// that will be used for this signing ceremony.
+	kIDs := make([]*big.Int, len(sortedSigningPartyIDs))
+	for i, p := range sortedSigningPartyIDs {
+		kIDs[i] = new(big.Int).SetBytes(p.Key)
+	}
+	localSaveData.Ks = kIDs
 
 	// 3. --- Setup Signing Parties ---
 	// Find the configuration for the current node
@@ -277,18 +281,6 @@ func SignMessage(cfg *config.Config, nodeName string, keyID uuid.UUID, message s
 
 	hash := sha256.Sum256([]byte(message))
 	msgToSign := new(big.Int).SetBytes(hash[:])
-
-	// Find the PartyID for the current node
-	var currentPartyID *tss.PartyID
-	for _, pID := range sortedSigningPartyIDs {
-		if pID.Id == nodeName {
-			currentPartyID = pID
-			break
-		}
-	}
-	if currentPartyID == nil {
-		return nil, fmt.Errorf("could not find party ID for current node '%s'", nodeName)
-	}
 
 	params := tss.NewParameters(tss.S256(), tss.NewPeerContext(sortedSigningPartyIDs), currentPartyID, len(sortedSigningPartyIDs), keyRecord.Threshold)
 	if localSaveData.ShareID == nil {

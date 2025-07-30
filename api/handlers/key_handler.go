@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"math/big"
-	"mpc-node/internal/config"
 	"mpc-node/internal/logger"
 	"mpc-node/internal/network"
 	"mpc-node/internal/party"
@@ -214,86 +213,80 @@ func SignMessage(c *gin.Context) {
 		return
 	}
 
-	// Retrieve the config from the context
-	cfg, exists := c.Get("config")
-	if !exists {
-		logger.Log.Error("Config not found in context")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Server configuration error",
-		})
-		return
-	}
-	appConfig, ok := cfg.(*config.Config)
-	if !ok {
-		logger.Log.Error("Invalid config type in context")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Invalid server configuration",
-		})
-		return
-	}
+	// --- Retrieve services from context ---
+	nodeName, _ := c.Get("nodeName")
+	nodeNameStr, _ := nodeName.(string)
 
-	// Retrieve the nodeName from the context
-	nodeName, exists := c.Get("nodeName")
-	if !exists {
-		logger.Log.Error("Node name not found in context")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Server configuration error: node name missing",
-		})
-		return
-	}
-	nodeNameStr, ok := nodeName.(string)
-	if !ok {
-		logger.Log.Error("Invalid node name type in context")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Invalid server configuration: node name type",
-		})
-		return
-	}
+	sm, _ := c.Get("sessionManager")
+	sessionManager, _ := sm.(*session.Manager)
 
-	// Retrieve the transport from the context
-	transportVal, exists := c.Get("transport")
-	if !exists {
-		logger.Log.Error("Transport not found in context")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Server configuration error: transport missing",
-		})
-		return
-	}
-	transport, ok := transportVal.(network.Transport)
-	if !ok {
-		logger.Log.Error("Invalid transport type in context")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Invalid server configuration: transport type",
-		})
-		return
-	}
+	transport, _ := c.Get("transport")
+	transportVal, _ := transport.(network.Transport)
 
+	// --- 1. Find the key and its participants ---
 	keyUUID, err := uuid.Parse(req.KeyID)
 	if err != nil {
-		logger.Log.Errorf("Invalid KeyID format: %s", req.KeyID)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid KeyID format"})
 		return
 	}
+	var keyRecord models.KeyData
+	if err := storage.DB.First(&keyRecord, "key_id = ?", keyUUID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "key not found"})
+		return
+	}
+	participants := strings.Split(keyRecord.PartyIDs, ",")
 
-	signature, err := tss.SignMessage(appConfig, nodeNameStr, keyUUID, req.Message, transport)
-	if err != nil {
-		logger.Log.Errorf("Failed to sign message for key %s: %v", req.KeyID, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to sign message: " + err.Error()})
+	// --- 2. Create a new signing session ---
+	sessionID := uuid.New().String()
+	// For signing, any node can be the coordinator. The node receiving the API call is the natural choice.
+	signingSession := sessionManager.GetOrCreateSession(sessionID, participants, nodeNameStr)
+	signingSession.KeyID = req.KeyID
+	signingSession.MessageToSign = req.Message
+
+	// --- 3. Broadcast the request to sign ---
+	payload, _ := json.Marshal(network.RequestSignaturePayload{
+		KeyID:   req.KeyID,
+		Message: req.Message,
+	})
+
+	// Find current party ID
+	var currentPartyID *tsslib.PartyID
+	// This is a simplification. A robust solution would use sorted party IDs.
+	currentPartyID = tsslib.NewPartyID(nodeNameStr, nodeNameStr, new(big.Int).SetInt64(1))
+
+	broadcastMsg := &network.CoordinationMessage{
+		Type:      network.RequestSignature,
+		SessionID: sessionID,
+		Payload:   payload,
+		From:      currentPartyID,
+		To:        nil, // Broadcast to all
+	}
+
+	if err := transportVal.SendCoordinationMessage(broadcastMsg); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start signing ceremony"})
 		return
 	}
 
-	// Map to our custom SignatureData struct for camelCase response
-	response := SignatureData{
-		Signature:         signature.Signature,
-		SignatureRecovery: signature.SignatureRecovery,
-		R:                 signature.R,
-		S:                 signature.S,
-		M:                 signature.M,
-	}
+	// --- 4. Wait for the result ---
+	select {
+	case result := <-signingSession.SignatureResult:
+		if result.Error != "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate signature: " + result.Error})
+			return
+		}
+		// Map to our custom SignatureData struct for camelCase response
+		response := SignatureData{
+			Signature:         result.Signature.Signature,
+			SignatureRecovery: result.Signature.SignatureRecovery,
+			R:                 result.Signature.R,
+			S:                 result.Signature.S,
+			M:                 result.Signature.M,
+		}
+		c.JSON(http.StatusOK, gin.H{"signature": response})
 
-	c.JSON(http.StatusOK, gin.H{
-		"signature": response,
-	})
+	case <-time.After(60 * time.Second): // Timeout
+		c.JSON(http.StatusRequestTimeout, gin.H{"error": "Signing ceremony timed out"})
+	}
 }
 
 func VerifySignature(c *gin.Context) {

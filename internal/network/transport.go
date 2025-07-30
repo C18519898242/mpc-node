@@ -3,11 +3,11 @@ package network
 import (
 	"encoding/json"
 	"fmt"
-	"mpc-node/internal/dto"
 	"mpc-node/internal/logger"
 	"net"
 	"time"
 
+	"github.com/bnb-chain/tss-lib/v2/ecdsa/keygen"
 	tsslib "github.com/bnb-chain/tss-lib/v2/tss"
 )
 
@@ -15,11 +15,19 @@ import (
 type CoordinationMessageType string
 
 const (
+	// Keygen
 	KeyIDBroadcast        CoordinationMessageType = "KeyIDBroadcast"
 	KeyIDAck              CoordinationMessageType = "KeyIDAck"
 	StartKeygen           CoordinationMessageType = "StartKeygen"
 	KeygenPublicDataShare CoordinationMessageType = "KeygenPublicDataShare"
 	KeygenResultBroadcast CoordinationMessageType = "KeygenResultBroadcast"
+
+	// Signing
+	StartSigning      CoordinationMessageType = "StartSigning"
+	SignatureShare    CoordinationMessageType = "SignatureShare"
+	SigningResult     CoordinationMessageType = "SigningResult"
+	RequestSignature  CoordinationMessageType = "RequestSignature"
+	SignatureResponse CoordinationMessageType = "SignatureResponse"
 )
 
 // CoordinationMessage is a generic container for non-TSS coordination messages.
@@ -44,13 +52,19 @@ type KeyIDAckPayload struct {
 
 // KeygenPublicDataPayload is the payload for a KeygenPublicDataShare message.
 type KeygenPublicDataPayload struct {
-	PublicData *dto.PublicPartySaveData `json:"publicData"`
+	SaveData *keygen.LocalPartySaveData `json:"saveData"`
 }
 
 // KeygenResultBroadcastPayload is the payload for the final broadcast from the coordinator.
 type KeygenResultBroadcastPayload struct {
 	PublicKey    string `json:"publicKey"`
 	FullSaveData []byte `json:"fullSaveData"`
+}
+
+// RequestSignaturePayload is the payload for a RequestSignature message.
+type RequestSignaturePayload struct {
+	KeyID   string `json:"keyId"`
+	Message string `json:"message"`
 }
 
 // Transport defines the interface for network communication.
