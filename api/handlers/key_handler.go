@@ -13,6 +13,7 @@ import (
 	"mpc-node/internal/storage/models"
 	"mpc-node/internal/tss"
 	"net/http"
+	"strings"
 	"time"
 
 	tsslib "github.com/bnb-chain/tss-lib/v2/tss"
@@ -85,10 +86,27 @@ func GenerateKey(c *gin.Context) {
 		keyID := uuid.New()
 		session.KeyID = keyID.String() // Set KeyID in the local session state
 
-		logger.Log.Infof("Coordinator %s: Generated KeyID %s for session %s. Broadcasting...", nodeName, keyID, req.SessionID)
+		// Create a placeholder KeyData record in the database immediately.
+		// This ensures that foreign key constraints are met when followers save their shares.
+		placeholderKey := models.KeyData{
+			KeyID:     keyID,
+			PartyIDs:  strings.Join(req.Participants, ","),
+			Threshold: 1, // This will be updated later by the coordinator
+			PublicKey: "placeholder-" + keyID.String(),
+		}
+		if err := storage.DB.Create(&placeholderKey).Error; err != nil {
+			logger.Log.Errorf("Coordinator failed to create placeholder key record: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize key record"})
+			return
+		}
+
+		logger.Log.Infof("Coordinator %s: Generated KeyID %s and created placeholder record for session %s. Broadcasting...", nodeName, keyID, req.SessionID)
 
 		// Prepare broadcast message
-		payload, _ := json.Marshal(network.KeyIDBroadcastPayload{KeyID: keyID.String()})
+		payload, _ := json.Marshal(network.KeyIDBroadcastPayload{
+			KeyID:        keyID.String(),
+			Participants: req.Participants,
+		})
 		broadcastMsg := &network.CoordinationMessage{
 			Type:      network.KeyIDBroadcast,
 			SessionID: req.SessionID,

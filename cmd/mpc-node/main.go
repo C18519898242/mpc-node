@@ -44,8 +44,12 @@ func main() {
 		logger.Log.Fatalf("Configuration for node %s not found", *nodeName)
 	}
 
-	// Initialize database
-	storage.InitDB(cfg.Database)
+	// Initialize database for the specific node
+	dbConfig, ok := cfg.Databases[*nodeName]
+	if !ok {
+		logger.Log.Fatalf("Database configuration for node %s not found", *nodeName)
+	}
+	storage.InitDB(dbConfig)
 	logger.Log.Info("Database initialized.")
 
 	// --- Create services ---

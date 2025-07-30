@@ -41,10 +41,10 @@ type Node struct {
 
 // Config holds the application's configuration values.
 type Config struct {
-	ServerPort string       `json:"server_port"`
-	Nodes      []Node       `json:"nodes"`
-	Database   DBConfig     `json:"database"`
-	Logger     LoggerConfig `json:"logger"`
+	ServerPort string              `json:"server_port"`
+	Nodes      []Node              `json:"nodes"`
+	Databases  map[string]DBConfig `json:"databases"`
+	Logger     LoggerConfig        `json:"logger"`
 }
 
 // LoadConfig reads the configuration from a file and returns a Config struct.

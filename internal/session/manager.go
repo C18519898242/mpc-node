@@ -1,6 +1,7 @@
 package session
 
 import (
+	"mpc-node/internal/dto"
 	"sync"
 	"time"
 
@@ -14,7 +15,8 @@ type SessionState struct {
 	Participants     []string
 	Coordinator      string
 	Acknowledgements map[string]bool // Tracks which participants have acknowledged the keyID
-	Status           string          // e.g., "Pending", "Ready", "Finished", "Failed"
+	PublicDataShares map[string]*dto.PublicPartySaveData
+	Status           string // e.g., "Pending", "Ready", "Finished", "Failed"
 	CreatedAt        time.Time
 	Done             chan struct{} // Channel to signal completion of the ceremony
 }
@@ -46,6 +48,7 @@ func (m *Manager) GetOrCreateSession(sessionID string, participants []string, co
 		Participants:     participants,
 		Coordinator:      coordinator,
 		Acknowledgements: make(map[string]bool),
+		PublicDataShares: make(map[string]*dto.PublicPartySaveData),
 		Status:           "Pending",
 		CreatedAt:        time.Now(),
 		Done:             make(chan struct{}),

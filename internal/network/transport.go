@@ -3,20 +3,23 @@ package network
 import (
 	"encoding/json"
 	"fmt"
+	"mpc-node/internal/dto"
 	"mpc-node/internal/logger"
 	"net"
 	"time"
 
-	"github.com/bnb-chain/tss-lib/v2/tss"
+	tsslib "github.com/bnb-chain/tss-lib/v2/tss"
 )
 
 // CoordinationMessageType defines the type of a coordination message.
 type CoordinationMessageType string
 
 const (
-	KeyIDBroadcast CoordinationMessageType = "KeyIDBroadcast"
-	KeyIDAck       CoordinationMessageType = "KeyIDAck"
-	StartKeygen    CoordinationMessageType = "StartKeygen"
+	KeyIDBroadcast        CoordinationMessageType = "KeyIDBroadcast"
+	KeyIDAck              CoordinationMessageType = "KeyIDAck"
+	StartKeygen           CoordinationMessageType = "StartKeygen"
+	KeygenPublicDataShare CoordinationMessageType = "KeygenPublicDataShare"
+	KeygenResultBroadcast CoordinationMessageType = "KeygenResultBroadcast"
 )
 
 // CoordinationMessage is a generic container for non-TSS coordination messages.
@@ -24,13 +27,14 @@ type CoordinationMessage struct {
 	Type      CoordinationMessageType `json:"type"`
 	SessionID string                  `json:"sessionId"`
 	Payload   json.RawMessage         `json:"payload"`
-	From      *tss.PartyID            `json:"from"`
-	To        []*tss.PartyID          `json:"to"`
+	From      *tsslib.PartyID         `json:"from"`
+	To        []*tsslib.PartyID       `json:"to"`
 }
 
 // KeyIDBroadcastPayload is the payload for a KeyIDBroadcast message.
 type KeyIDBroadcastPayload struct {
-	KeyID string `json:"keyId"`
+	KeyID        string   `json:"keyId"`
+	Participants []string `json:"participants"`
 }
 
 // KeyIDAckPayload is the payload for a KeyIDAck message.
@@ -38,9 +42,20 @@ type KeyIDAckPayload struct {
 	// No extra payload needed for a simple ack
 }
 
+// KeygenPublicDataPayload is the payload for a KeygenPublicDataShare message.
+type KeygenPublicDataPayload struct {
+	PublicData *dto.PublicPartySaveData `json:"publicData"`
+}
+
+// KeygenResultBroadcastPayload is the payload for the final broadcast from the coordinator.
+type KeygenResultBroadcastPayload struct {
+	PublicKey    string `json:"publicKey"`
+	FullSaveData []byte `json:"fullSaveData"`
+}
+
 // Transport defines the interface for network communication.
 type Transport interface {
-	Send(msg tss.Message) error
+	Send(msg tsslib.Message) error
 	SendCoordinationMessage(msg *CoordinationMessage) error
 }
 
@@ -57,7 +72,7 @@ func NewTCPTransport(partyIDMap map[string]string) *TCPTransport {
 }
 
 // Send marshals the message and sends it to the destination parties.
-func (t *TCPTransport) Send(msg tss.Message) error {
+func (t *TCPTransport) Send(msg tsslib.Message) error {
 	dest := msg.GetTo()
 	if dest == nil { // broadcast
 		logger.Log.Infof("[TCPTransport] Broadcasting message type %s from %s", msg.Type(), msg.GetFrom().Id)
@@ -113,7 +128,7 @@ func (t *TCPTransport) SendCoordinationMessage(msg *CoordinationMessage) error {
 	return nil
 }
 
-func (t *TCPTransport) sendMessage(addr string, msg tss.Message) error {
+func (t *TCPTransport) sendMessage(addr string, msg tsslib.Message) error {
 	bytes, _, err := msg.WireBytes()
 	if err != nil {
 		return fmt.Errorf("failed to get wire bytes for message: %v", err)
@@ -121,7 +136,7 @@ func (t *TCPTransport) sendMessage(addr string, msg tss.Message) error {
 
 	// This is a basic wire protocol.
 	type TSSWireMessage struct {
-		From        *tss.PartyID
+		From        *tsslib.PartyID
 		IsBroadcast bool
 		Payload     []byte
 	}
@@ -136,8 +151,8 @@ func (t *TCPTransport) sendMessage(addr string, msg tss.Message) error {
 
 // WireMessage is a wrapper for any message sent over the wire.
 type WireMessage struct {
-	MessageType string      `json:"messageType"` // "TSS" or "Coordination"
-	Payload     interface{} `json:"payload"`
+	MessageType string          `json:"messageType"` // "TSS" or "Coordination"
+	Payload     json.RawMessage `json:"payload"`
 }
 
 func (t *TCPTransport) sendJSON(addr string, payload interface{}, messageType string) error {
@@ -147,9 +162,14 @@ func (t *TCPTransport) sendJSON(addr string, payload interface{}, messageType st
 	}
 	defer conn.Close()
 
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload for wire message: %v", err)
+	}
+
 	wireMsg := WireMessage{
 		MessageType: messageType,
-		Payload:     payload,
+		Payload:     payloadBytes,
 	}
 
 	encoder := json.NewEncoder(conn)
